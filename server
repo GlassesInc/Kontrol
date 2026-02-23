@@ -26,8 +26,11 @@ try:
 except ImportError:
     psutil = None
 
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 5555
+DEFAULT_HOST = os.getenv("KONTROL_BIND_HOST", "0.0.0.0")
+try:
+    DEFAULT_PORT = int(os.getenv("KONTROL_BIND_PORT", "5555"))
+except ValueError:
+    DEFAULT_PORT = 5555
 
 
 # =========================

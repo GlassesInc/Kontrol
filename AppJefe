@@ -30,8 +30,11 @@ import matplotlib.animation as animation
 from tasks_module import TasksModule, DEFAULT_THEME
 
 
-DEFAULT_HOST = "185.254.207.202"
-DEFAULT_PORT = 5555
+DEFAULT_HOST = os.getenv("KONTROL_SERVER_HOST", "185.254.207.202")
+try:
+    DEFAULT_PORT = int(os.getenv("KONTROL_SERVER_PORT", "5555"))
+except ValueError:
+    DEFAULT_PORT = 5555
 # ----------------------------
 # Theme / Colors
 # ----------------------------
@@ -1457,6 +1460,25 @@ class PerfomanceView(ctk.CTkFrame):
         except:
             pass
 
+    def _schedule_render_tabs(self, delay_ms: int = 80):
+        """Debounce de render para evitar congelamientos cuando llegan muchos mensajes seguidos."""
+        try:
+            prev = getattr(self, "_render_after_id", None)
+            if prev:
+                self.after_cancel(prev)
+        except Exception:
+            pass
+
+        def _run():
+            self._render_after_id = None
+            self.clear_loading()
+            self._render_all_tabs()
+
+        try:
+            self._render_after_id = self.after(max(0, int(delay_ms)), _run)
+        except Exception:
+            _run()
+
     def update_data(self, active_time_str=None, inactive_time_str=None, history_raw=None, all_users_stats=None,
                     user_list=None):
         # actualiza estado
@@ -1474,15 +1496,8 @@ class PerfomanceView(ctk.CTkFrame):
         if all_users_stats is not None:
             self.all_users_stats = all_users_stats
 
-        # quita loading y re-renderiza
-        def _do():
-            self.clear_loading()
-            self._render_all_tabs()
-
-        try:
-            self.after(0, _do)
-        except:
-            _do()
+        # quita loading y re-renderiza (debounced para evitar picos)
+        self._schedule_render_tabs(80)
 
     def _parse_duration_to_seconds(self, s: str) -> int:
         import re
@@ -5202,6 +5217,9 @@ class KClientApp(ctk.CTk):
             "SHOW_POPUP|",
             "TAKE_SCREENSHOT|",
             "SYNC_CHECK|",
+            "AI_LOG_DATA|",
+            "AI_CHAT_RESP|",
+            "PONG",
         )
         return line.startswith(prefixes)
 
@@ -5318,8 +5336,6 @@ class KClientApp(ctk.CTk):
             except Exception as e:
                 print(f"Widget ya no existe, ignorando actualización: {e}")
 
-        self.after(0, ui)
-
         try:
             self.after(0, ui)
         except Exception:
@@ -5384,12 +5400,10 @@ class KClientApp(ctk.CTk):
 
         self.server_entry = ctk.CTkEntry(row, placeholder_text="IP servidor", fg_color=CARD2)
         self.server_entry.insert(0, DEFAULT_HOST)
-        self.server_entry.configure(state="disabled")
         self.server_entry.pack(side="left", expand=True, fill="x", padx=(0, 8))
 
         self.port_entry = ctk.CTkEntry(row, placeholder_text="Puerto", width=90, fg_color=CARD2)
         self.port_entry.insert(0, str(DEFAULT_PORT))
-        self.port_entry.configure(state="disabled")
         self.port_entry.pack(side="left")
 
         self.btn_login = ctk.CTkButton(box, text="Conectar", fg_color=TURQ, text_color="#001013",
@@ -5447,11 +5461,17 @@ class KClientApp(ctk.CTk):
     def _do_login(self):
         u = self.user_entry.get().strip()
         pw = self.pass_entry.get().strip()
-        host = DEFAULT_HOST
-        port = DEFAULT_PORT
+        host = (self.server_entry.get().strip() or DEFAULT_HOST)
+        port_raw = (self.port_entry.get().strip() or str(DEFAULT_PORT))
 
         if not u or not pw:
             messagebox.showerror("Error", "Usuario y contraseña requeridos.")
+            return
+
+        try:
+            port = int(port_raw)
+        except ValueError:
+            messagebox.showerror("Error", "Puerto inválido.")
             return
 
         self.btn_login.configure(state="disabled", text="Conectando...")
@@ -6305,16 +6325,7 @@ class KClientApp(ctk.CTk):
         except Exception:
             pass
 
-        # 4) best-effort: si el server tiene comandos específicos de online/log
-        try:
-            with self.socket_lock:
-                for cmd in ("REQUEST_ONLINE_USERS", "REQUEST_ONLINE_LOG", "REQUEST_ONLINE_HISTORY"):
-                    try:
-                        self.sock.sendall((cmd + "\n").encode("utf-8"))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        # 4) Se removieron comandos legacy no soportados por server para evitar ruido de protocolo.
 
     def _build_all_users_stats(self):
         latest = getattr(self, "_latest_stats", {}) or {}
@@ -7547,8 +7558,6 @@ class KClientApp(ctk.CTk):
                     self.lbl_detail.configure(text=f"Empleado: {user} | Fecha: {req_date}\nEstado: {status}")
                     self._ui_set_history_text(history_raw)
             self._flush_user_stats_block()
-            time.sleep(0.01)
-
 
             # ✅ FIX: actualizar selected_day en perf_view si corresponde al usuario activo
             # (así la UI queda en sintonía con los datos que llegaron)
@@ -7556,8 +7565,8 @@ class KClientApp(ctk.CTk):
                 if (hasattr(self, "perf_view") and self.perf_view
                         and self.perf_view.winfo_exists()
                         and getattr(self.perf_view, "target_user", None) == user
-                        and date_str):
-                    d_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        and req_date):
+                    d_obj = datetime.strptime(req_date, "%Y-%m-%d").date()
                     # sincronizar sin re-disparar request al server
                     self.after(0, lambda d=d_obj: self.perf_view._set_selected_day(d, notify_server=False))
             except Exception:
@@ -7598,6 +7607,9 @@ class KClientApp(ctk.CTk):
             if not self._should_ignore_duplicate_user_list(users):
                 self._start_auto_stats_refresh(users)
 
+            return
+
+        if line == "PONG":
             return
 
         if line.startswith("CONSOLE_OUTPUT|"):

@@ -32,8 +32,11 @@ from googleapiclient.discovery import build
 # =========================
 # CONFIG
 # =========================
-DEFAULT_HOST = "185.254.207.202"
-DEFAULT_PORT = 5555
+DEFAULT_HOST = os.getenv("KONTROL_SERVER_HOST", "185.254.207.202")
+try:
+    DEFAULT_PORT = int(os.getenv("KONTROL_SERVER_PORT", "5555"))
+except ValueError:
+    DEFAULT_PORT = 5555
 
 ctk.set_appearance_mode("Dark")
 
