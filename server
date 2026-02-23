@@ -1,0 +1,3507 @@
+import socket
+import threading
+import os
+import shutil
+import time
+import json
+import uuid
+import re
+import csv
+import sys
+from datetime import datetime, timedelta
+from collections import Counter
+from collections import deque
+import base64
+
+# OpenAI (server-side)
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+
+# Opcional (solo si lo tenés instalado)
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 5555
+
+
+# =========================
+# UTILIDADES DE ARCHIVOS
+# =========================
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def ensure_file(path: str):
+    ensure_dir(os.path.dirname(path) or ".")
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as _:
+            pass
+
+
+def safe_append(path: str, text: str, lock: threading.Lock):
+    with lock:
+        ensure_file(path)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+
+
+def safe_read_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except:
+        return ""
+
+
+# =========================
+# WRAPPER POR CLIENTE
+# (evita mezcla de sendall)
+# =========================
+class ClientConn:
+    def __init__(self, sock: socket.socket, addr):
+        self.sock = sock
+        self.addr = addr
+        self.send_lock = threading.Lock()
+        self.alive = True
+
+    def sendall(self, data: bytes):
+        with self.send_lock:
+            self.sock.sendall(data)
+
+    def close(self):
+        self.alive = False
+        try:
+            self.sock.close()
+        except:
+            pass
+
+
+# =========================
+# SERVER
+# =========================
+class TerminalServer:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.is_running = True
+
+        # conn_wrapper -> info
+        self.clients = {}
+        self.clients_lock = threading.Lock()
+
+        # user -> datetime last_activity
+        self.last_activity = {}
+        self.last_lock = threading.Lock()
+
+        self.file_lock = threading.Lock()
+        self.ai_hist_days = 7  # últimos N días para historial
+        self.ai_hist_top_n = 8  # top apps para historial
+
+        # ✅ NUEVO: tareas + premios (sync)
+        self.tasks_lock = threading.Lock()
+        self.rewards_lock = threading.Lock()
+
+        # Cache en RAM
+        self.user_pass_cache = {}
+        self.user_role_cache = {}
+
+        # Rutas
+        self.assets_dir = "assets"
+        self.db_dir = "basededatos"
+        self.stats_dir = os.path.join(self.db_dir, "stats")
+        self.diary_dir = os.path.join(self.db_dir, "diary")
+        self.capturas_dir = os.path.join(self.db_dir, "capturas")
+        self.backups_dir = os.path.join(self.db_dir, "respaldos_semanales")
+        # ✅ THROTTLE CAPTURAS (por usuario)
+        self.ss_throttle_lock = threading.Lock()
+        self.ss_throttle = {}  # user -> {"count": int, "last_save_ts": float, "last_fwd_ts": float}
+
+        # Modo 1: guardar/reenviar 1 cada N capturas
+        self.SS_SAVE_EVERY_N = 10  # guarda 1 de cada 10
+        self.SS_FWD_EVERY_N = 3  # reenvía 1 de cada 3 (ajustá)
+
+        # Modo 2 (opcional): además, mínimo X segundos entre guardados
+        self.SS_MIN_SAVE_SECONDS = 0  # por ejemplo 30 (si querés), 0 = desactivado
+        self.SS_MIN_FWD_SECONDS = 0  # por ejemplo 5, 0 = desactivado
+
+        # ✅ NUEVO: store de tareas y premios
+        self.tasks_dir = os.path.join(self.db_dir, "tasks")
+        self.rewards_dir = os.path.join(self.db_dir, "rewards")
+        ensure_dir(self.tasks_dir)
+        ensure_dir(self.rewards_dir)
+
+        # NUEVO: actividad V2 (JSON FG/BG)
+        self.activity_dir = os.path.join(self.db_dir, "activity")
+
+        self.pass_file = os.path.join(self.assets_dir, "contraseñas.txt")
+        self.role_file = os.path.join(self.assets_dir, "roles.txt")
+        self.session_log_file = os.path.join(self.db_dir, "sesiones.txt")
+        self.command_log_file = os.path.join(self.db_dir, "registro_comandos.txt")
+        self.wifi_log_file = os.path.join(self.db_dir, "status_wifi.txt")
+
+        # =========================================================
+        # ✅ NUEVO: Persistencia robusta (NO se pierde en reinicios)
+        # Requisito: usar carpeta "data/" o "storage/" sin romper nada
+        # =========================================================
+        self.data_dir = "data"
+        self.state_file = os.path.join(self.data_dir, "server_state.json")
+        self.exports_dir = os.path.join(self.data_dir, "exports")
+        # =========================
+        # ✅ RESTRICCIONES / EXCEPCIONES (ocio)
+        # =========================
+        self.restrictions_dir = os.path.join(self.data_dir, "restrictions")
+        self.distractions_json = os.path.join(self.restrictions_dir, "distraction_keywords.json")
+        self.restrictions_meta_json = os.path.join(self.restrictions_dir,
+                                                   "restrictions_meta.json")  # version + last_change
+        self.boss_terms_txt = os.path.join(self.restrictions_dir, "boss_terms_ack.txt")  # boss:0/1
+
+        # Marca de tiempo para uptime
+        self.start_ts = time.time()
+        # =========================
+        # ✅ IA SCREENSHOT ANALYZER (SERVER-SIDE)
+        # =========================
+        self.ai_enabled = True
+        self.ai_model = "gpt-4.1-mini"  # el que vos quieras
+        self.ai_max_mem = 80  # rolling memory por user
+        self.ai_last_summary = {}  # user -> string resumen anterior
+        self.ai_memory = {}  # user -> deque[str] (últimas entradas)
+        self.ai_queue = deque(maxlen=5000)  # cola global de capturas a analizar
+        self.ai_queue_lock = threading.Lock()
+
+        # Logs diarios IA
+        self.ai_logs_dir = os.path.join(self.data_dir, "ai_logs")
+        ensure_dir(self.ai_logs_dir)
+
+        # Cliente OpenAI (usa OPENAI_API_KEY del sistema)
+        self.ai_client = None
+        if self.ai_enabled and OPENAI_AVAILABLE:
+            try:
+                self.ai_client = OpenAI()
+            except Exception as e:
+                self.log_to_console(f"OpenAI init error: {e}", "ERR")
+                self.ai_client = None
+
+        # Worker thread IA
+        threading.Thread(target=self.ai_worker_loop, daemon=True).start()
+
+        # =========================================================
+        # ✅ NUEVO: Colores consola tipo CMD (0-9)
+        # =========================================================
+        self.console_default_color = 0
+        self._enable_windows_ansi()
+
+        self.check_system_files()
+        self.load_user_data_to_ram()
+        # ✅ asegura que exista distractions_json y meta
+        self._load_distraction_config()
+
+        # Cargar estado persistente (si existe)
+        self.state = self._load_state()
+
+        # Asegura estructura para usuarios existentes
+        self._ensure_state_users()
+
+        # Si cambió semana desde último arranque -> rotar
+        self._rotate_if_week_changed()
+
+        threading.Thread(target=self.persistence_loop, daemon=True).start()
+        threading.Thread(target=self.weekly_reset_loop, daemon=True).start()
+
+    # -------------------------
+    # INIT
+    # -------------------------
+    def check_system_files(self):
+        for d in [
+            self.assets_dir,
+            self.db_dir,
+            self.stats_dir,
+            self.diary_dir,
+            self.capturas_dir,
+            self.backups_dir,
+            self.activity_dir,
+            self.data_dir,
+            self.exports_dir,
+            self.restrictions_dir,
+        ]:
+            ensure_dir(d)
+        for f in [self.pass_file, self.role_file, self.session_log_file, self.command_log_file, self.wifi_log_file,
+                  self.distractions_json,
+                  self.restrictions_meta_json,
+                  self.boss_terms_txt, ]:
+            ensure_file(f)
+        ensure_file(self.state_file)
+
+    def _ai_user_mem(self, user: str):
+        if user not in self.ai_memory:
+            self.ai_memory[user] = deque(maxlen=self.ai_max_mem)
+        return self.ai_memory[user]
+
+    def _week_seconds(self, dhms_str: str) -> int:
+        # "Xd Yh Zm" -> seconds aprox
+        try:
+            parts = dhms_str.replace("d", " d ").replace("h", " h ").replace("m", " m ").split()
+            d = int(parts[0]) if "d" in parts else 0
+        except:
+            d = 0
+        try:
+            # buscar el número antes de 'h'
+            idx = parts.index("h")
+            h = int(parts[idx - 1])
+        except:
+            h = 0
+        try:
+            idx = parts.index("m")
+            m = int(parts[idx - 1])
+        except:
+            m = 0
+        return int(d) * 86400 + int(h) * 3600 + int(m) * 60
+
+    def _ai_build_history_context(self, user: str, days: int = 7, top_n: int = 8) -> dict:
+        """
+        Historial resumido para que:
+        - quede guardado dentro del AI log (jsonl)
+        - la IA lo use como contexto en cada screenshot
+        """
+        self._ensure_state_users()
+        ud = self.state["users"].get(user, {}) if self.state.get("users") else {}
+
+        # semana actual vs anterior (segundos)
+        cur_act = int(ud.get("weekly_active", 0) or 0)
+        cur_ina = int(ud.get("weekly_inactive", 0) or 0)
+
+        prev = ud.get("prev_week") or {}
+        prev_act = int(prev.get("weekly_active", 0) or 0)
+        prev_ina = int(prev.get("weekly_inactive", 0) or 0)
+
+        # activity V2 últimos N días
+        total = self._sum_activity_v2_days(user, days=max(1, int(days)))
+        kpi = self._estimate_kpi_from_activity(total)
+
+        fg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)[:top_n]
+        bg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)[:top_n]
+
+        top_fg = [{"app": a, "sec": int(float(v.get("fg", 0.0)))} for a, v in fg_sorted]
+        top_bg = [{"app": a, "sec": int(float(v.get("bg", 0.0)))} for a, v in bg_sorted]
+
+        # top distracciones (según tu heurística actual)
+        distract = []
+        for a, v in fg_sorted:
+            sec = int(float(v.get("fg", 0.0)))
+            if sec > 0 and self._is_distracting_app(a):
+                distract.append({"app": a, "sec": sec})
+
+        # flags simples de tendencia
+        flags = []
+        if prev.get("week_id"):
+            if (cur_act - prev_act) < -3600:
+                flags.append("weekly_active_down")
+            if (cur_ina - prev_ina) > 3600:
+                flags.append("weekly_inactive_up")
+
+        if int(kpi.get("kpi_pct", 0) or 0) < 60:
+            flags.append("kpi_low")
+
+        return {
+            "days": int(days),
+            "week_id": self.state.get("meta", {}).get("week_id", self._week_id_now()),
+            "prev_week_id": prev.get("week_id"),
+            "weekly_active_sec": cur_act,
+            "weekly_inactive_sec": cur_ina,
+            "prev_weekly_active_sec": prev_act,
+            "prev_weekly_inactive_sec": prev_ina,
+            "delta_weekly_active_sec": cur_act - prev_act,
+            "delta_weekly_inactive_sec": cur_ina - prev_ina,
+            "kpi_est": kpi,  # {productive_sec, distracting_sec, kpi_pct}
+            "top_fg": top_fg,
+            "top_bg": top_bg,
+            "top_distractions_fg": distract[:top_n],
+            "history_flags": flags
+        }
+
+    def _build_week_context(self, user: str, days: int = 7) -> dict:
+        self._ensure_state_users()
+        ud = self.state["users"].get(user, {}) if self.state.get("users") else {}
+
+        # tiempos
+        w_act_str, w_ina_str = self._get_times_from_state_weekly(user)
+        l_act_str, l_ina_str = self._get_times_from_state_lifetime(user)
+
+        # prev week (si existe)
+        prev = ud.get("prev_week") or {}
+        prev_act = int(prev.get("weekly_active", 0) or 0)
+        prev_ina = int(prev.get("weekly_inactive", 0) or 0)
+
+        # current week en segundos (desde state)
+        cur_act = int(ud.get("weekly_active", 0) or 0)
+        cur_ina = int(ud.get("weekly_inactive", 0) or 0)
+
+        # activity V2 últimos N días
+        total = self._sum_activity_v2_days(user, days=max(1, int(days)))
+        kpi = self._estimate_kpi_from_activity(total)
+
+        fg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
+        bg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
+
+        top_fg = [{"app": a, "sec": int(float(v.get("fg", 0.0)))} for a, v in fg_sorted[:12]]
+        top_bg = [{"app": a, "sec": int(float(v.get("bg", 0.0)))} for a, v in bg_sorted[:12]]
+
+        # top distracciones (según tu detector)
+        distract = []
+        for a, v in fg_sorted:
+            sec = int(float(v.get("fg", 0.0)))
+            if sec <= 0:
+                continue
+            if self._is_distracting_app(a):
+                distract.append({"app": a, "sec": sec})
+        distract = distract[:12]
+
+        role = self.user_role_cache.get(user, "empleado")
+
+        return {
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "user": user,
+            "role": role,
+            "days": int(days),
+            "week_id": self.state.get("meta", {}).get("week_id", self._week_id_now()),
+            "times": {
+                "weekly_active_str": w_act_str,
+                "weekly_inactive_str": w_ina_str,
+                "lifetime_active_str": l_act_str,
+                "lifetime_inactive_str": l_ina_str,
+                "weekly_active_sec": cur_act,
+                "weekly_inactive_sec": cur_ina,
+                "prev_week": {
+                    "week_id": prev.get("week_id"),
+                    "weekly_active_sec": prev_act,
+                    "weekly_inactive_sec": prev_ina,
+                }
+            },
+            "kpi_est": kpi,
+            "top_fg": top_fg,
+            "top_bg": top_bg,
+            "top_distractions_fg": distract,
+            "recent_ai_log": list(self._ai_user_mem(user))[-10:],
+            "prev_summary": self.ai_last_summary.get(user, ""),
+        }
+
+    def _render_week_report_simple(self, ctx: dict) -> str:
+        user = ctx.get("user", "")
+        days = ctx.get("days", 7)
+        role = ctx.get("role", "")
+        ts = ctx.get("ts", "")
+        week_id = ctx.get("week_id", "")
+
+        cur_act = int(ctx["times"].get("weekly_active_sec", 0) or 0)
+        cur_ina = int(ctx["times"].get("weekly_inactive_sec", 0) or 0)
+        prev = ctx["times"].get("prev_week", {}) or {}
+        prev_act = int(prev.get("weekly_active_sec", 0) or 0)
+        prev_ina = int(prev.get("weekly_inactive_sec", 0) or 0)
+
+        def fmt(sec: int) -> str:
+            return self._format_seconds_hm(int(sec))
+
+        delta_act = cur_act - prev_act
+        delta_ina = cur_ina - prev_ina
+
+        kpi = ctx.get("kpi_est", {}) or {}
+        kpi_pct = int(kpi.get("kpi_pct", 0) or 0)
+        prod = int(kpi.get("productive_sec", 0) or 0)
+        ocio = int(kpi.get("distracting_sec", 0) or 0)
+
+        lines = []
+        lines.append("=" * 86)
+        lines.append(f"AI_WEEK_SUMMARY | USER: {user} | ROL: {role} | días analizados (V2): {days} | {ts}")
+        lines.append(f"Week ID: {week_id}")
+        lines.append("-" * 86)
+        lines.append(f"Semana actual  Activo: {fmt(cur_act):<12} | Inactivo: {fmt(cur_ina):<12}")
+        if prev.get("week_id"):
+            lines.append(f"Semana anterior Activo: {fmt(prev_act):<12} | Inactivo: {fmt(prev_ina):<12}")
+            lines.append(f"Tendencia vs prev_week: ΔActivo {fmt(delta_act)} | ΔInactivo {fmt(delta_ina)}")
+        else:
+            lines.append("Semana anterior: (no disponible todavía)")
+        lines.append("-" * 86)
+        lines.append(
+            f"KPI estimado (por FG) últimos {days} días: {kpi_pct}% | Productivo {fmt(prod)} | Ocio {fmt(ocio)}")
+
+        # top FG
+        lines.append("-" * 86)
+        lines.append("Top apps FG (en foco):")
+        for row in (ctx.get("top_fg") or [])[:10]:
+            lines.append(f"  > {row['app'][:55]:<55} {fmt(row['sec'])}")
+
+        # distracciones
+        lines.append("")
+        lines.append("Top distracciones (FG):")
+        td = (ctx.get("top_distractions_fg") or [])[:10]
+        if not td:
+            lines.append("  (sin apps de ocio detectadas por heurística)")
+        else:
+            for row in td:
+                lines.append(f"  > {row['app'][:55]:<55} {fmt(row['sec'])}")
+
+        # señales rápidas
+        lines.append("-" * 86)
+        flags = []
+        if kpi_pct < 60:
+            flags.append("kpi_bajo")
+        if ocio > prod and (prod + ocio) > 0:
+            flags.append("ocio_mayor_que_productivo")
+        if cur_ina > cur_act and (cur_act + cur_ina) > 0:
+            flags.append("inactividad_alta_semana")
+        if prev.get("week_id") and delta_act < -3600:
+            flags.append("baja_activo_vs_semana_anterior")
+        if prev.get("week_id") and delta_ina > 3600:
+            flags.append("sube_inactivo_vs_semana_anterior")
+
+        lines.append("Flags:")
+        if flags:
+            for f in flags:
+                lines.append(f"  - {f}")
+        else:
+            lines.append("  - (sin flags fuertes)")
+
+        lines.append("=" * 86)
+        return "\n".join(lines)
+
+    def _ai_week_summary_text(self, user: str, days: int = 7) -> str:
+        ctx = self._build_week_context(user, days=days)
+        base_report = self._render_week_report_simple(ctx)
+
+        # Si no hay OpenAI, devolvemos el reporte simple
+        if not self.ai_client:
+            return base_report
+
+        # Si hay OpenAI, que lo redacte en español, conciso y accionable
+        prompt = (
+            "Sos un analista senior de productividad (agencia de viajes). "
+            "Con el CONTEXTO, redactá un resumen ejecutivo para el jefe.\n"
+            "Reglas:\n"
+            "- Español profesional.\n"
+            "- No inventes.\n"
+            "- Incluir: qué hizo, tendencia vs semana anterior, riesgos, próximos pasos.\n"
+            "- Corto y accionable.\n\n"
+            "CONTEXTO_JSON:\n"
+            f"{json.dumps(ctx, ensure_ascii=False)}\n\n"
+            "REPORTE_BASE:\n"
+            f"{base_report}\n"
+        )
+
+        try:
+            resp = self.ai_client.responses.create(
+                model=self.ai_model,
+                input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            )
+            txt = (resp.output_text or "").strip()
+            if not txt:
+                return base_report
+            return txt + "\n\n" + base_report
+        except:
+            return base_report
+
+    def _ai_day_str(self):
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _ai_log_path(self, user: str, day: str):
+        safe = re.sub(r"[^A-Za-z0-9_\-]", "_", (user or "unknown"))
+        udir = os.path.join(self.ai_logs_dir, safe)
+        ensure_dir(udir)
+        return os.path.join(udir, f"{day}.jsonl")
+
+    def _ai_append_log(self, user: str, day: str, obj: dict):
+        fp = self._ai_log_path(user, day)
+        line = json.dumps(obj, ensure_ascii=False)
+        with self.file_lock:
+            with open(fp, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def _ai_build_server_context(self, user: str) -> dict:
+        """
+        Arma un contexto rico usando TODO lo que ya guarda el server.
+        """
+        self._ensure_state_users()
+        ud = self.state["users"].get(user, {}) if self.state.get("users") else {}
+
+        # tiempos
+        w_act, w_ina = self._get_times_from_state_weekly(user)
+        l_act, l_ina = self._get_times_from_state_lifetime(user)
+
+        # online / role
+        with self.clients_lock:
+            online_names = {info.get("name") for info in self.clients.values()}
+        is_online = user in online_names
+        role = self.user_role_cache.get(user, "empleado")
+
+        # ping
+        last_ping = ud.get("last_ping_ms", None)
+
+        # activity V2 (último día)
+        total_today = self._sum_activity_v2_days(user, days=1)
+        kpi_today = self._estimate_kpi_from_activity(total_today)
+
+        # top apps (FG)
+        fg_sorted = sorted(total_today.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)[:10]
+        top_fg = [{"app": a, "sec": int(float(v.get("fg", 0.0)))} for a, v in fg_sorted]
+        hist_ctx = self._ai_build_history_context(user, days=self.ai_hist_days, top_n=self.ai_hist_top_n)
+
+        now = datetime.now()
+        return {
+            "ts": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "hour": now.hour,
+            "weekday": now.weekday(),  # 0 lunes ... 6 domingo
+            "user": user,
+            "role": role,
+            "is_online": bool(is_online),
+            "last_seen": ud.get("last_seen"),
+            "last_ping_ms": last_ping,
+            "weekly_active": w_act,
+            "weekly_inactive": w_ina,
+            "lifetime_active": l_act,
+            "lifetime_inactive": l_ina,
+            "kpi_today_est": kpi_today,
+            "top_fg_today": top_fg,
+            "prev_summary": self.ai_last_summary.get(user, ""),
+            "recent_ai_log": list(self._ai_user_mem(user))[-6:],  # últimas 6 entradas IA
+            "history_ctx": hist_ctx,
+            "history_days": self.ai_hist_days,
+
+        }
+
+    def _ai_analyze_screenshot(self, user: str, png_bytes: bytes) -> dict:
+        """
+        Llama a OpenAI con imagen + contexto del server + resumen anterior.
+        Devuelve dict (JSON).
+        """
+        if not self.ai_client:
+            return {
+                "type": "ai_analysis",
+                "user": user,
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "error": "OpenAI no disponible (faltan dependencias o OPENAI_API_KEY)."
+            }
+
+        # data url
+        b64 = base64.b64encode(png_bytes).decode("utf-8")
+        img_url = f"data:image/png;base64,{b64}"
+
+        ctx = self._ai_build_server_context(user)
+
+        prompt = (
+            "Sos un analista del escritorio (empresa). "
+            "Usá el CONTEXTO DEL SERVER (tiempos, rol, hora, KPI, top apps) + LOG RECIENTE IA "
+            "y el RESUMEN ANTERIOR para entender continuidad.\n\n"
+            "IMPORTANTE:\n"
+            "- Devolvé SOLO JSON válido.\n"
+            "- No pongas texto fuera del JSON.\n"
+            "- Sé conciso.\n\n"
+            "JSON schema:\n"
+            '{'
+            '"app_or_context": string, '
+            '"what_is_happening": string, '
+            '"errors_seen": string, '
+            '"risk_flags": [string], '
+            '"next_steps": [string, string, string], '
+            '"rolling_summary": string, '
+            '"confidence": "low|medium|high"'
+            '}\n\n'
+            "CONTEXTO_DEL_SERVER:\n"
+            f"{json.dumps(ctx, ensure_ascii=False)}"
+        )
+
+        resp = self.ai_client.responses.create(
+            model=self.ai_model,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": img_url},
+                ],
+            }],
+        )
+
+        txt = (resp.output_text or "").strip()
+        try:
+            obj = json.loads(txt)
+            if not isinstance(obj, dict):
+                raise ValueError("no dict")
+        except Exception:
+            obj = {
+                "app_or_context": "",
+                "what_is_happening": "",
+                "errors_seen": "",
+                "risk_flags": ["json_parse_failed"],
+                "next_steps": [],
+                "rolling_summary": txt[:8000],
+                "confidence": "low",
+            }
+
+        # enriquecer con metadata server
+        obj["_meta"] = {
+            "type": "ai_analysis",
+            "user": user,
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "hour": datetime.now().hour,
+            "weekday": datetime.now().weekday(),
+        }
+        return obj
+
+    def ai_worker_loop(self):
+        """
+        Hilo que procesa eventos en cola:
+        - screenshots: analiza con IA imagen
+        - tasks: analiza con IA texto/JSON
+        - guarda log diario
+        - actualiza memoria y resumen anterior
+        - (opcional) notifica a jefes si hay flags
+        """
+        while self.is_running:
+            item = None
+            with self.ai_queue_lock:
+                if self.ai_queue:
+                    item = self.ai_queue.popleft()
+
+            if not item:
+                time.sleep(0.05)
+                continue
+
+            try:
+                item_type = (item.get("type") or "screenshot").lower()
+                user = item.get("user") or "unknown"
+                day = item.get("day", self._ai_day_str())
+                fname = item.get("fname", "")
+
+                analysis = None
+                event_type = None
+
+                if item_type == "screenshot":
+                    png = item.get("png") or b""
+                    event_type = "screenshot"
+                    analysis = self._ai_analyze_screenshot(user, png)
+
+
+                elif item_type == "task":
+
+                    event_type = item.get("event_type") or "task"
+
+                    task_obj = item.get("task") or {}
+
+                    analysis = self._ai_analyze_task(user, task_obj)
+
+                    # ✅ NUEVO: pegar análisis al task guardado
+
+                    try:
+
+                        tid = ""
+
+                        if isinstance(task_obj, dict):
+                            tid = (task_obj.get("id") or task_obj.get("task_id") or "").strip()
+
+                        if tid:
+
+                            ok = self._attach_ai_analysis_to_task(user, tid, analysis)
+
+                            if ok:
+
+                                # opcional: avisar a jefes que ese task ya tiene IA lista
+
+                                try:
+
+                                    note = f"IA_TASK_READY|{user}|{tid}"
+
+                                    self._broadcast_to_role("jefe", note)
+
+                                except:
+
+                                    pass
+
+                    except Exception as e:
+
+                        self.log_to_console(f"Error attach IA to task: {e}", "ERR")
+
+
+                else:
+                    # tipo desconocido
+                    event_type = f"unknown:{item_type}"
+                    analysis = {
+                        "_meta": {
+                            "type": "ai_unknown_event",
+                            "user": user,
+                            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                        "risk_flags": ["unknown_event_type"],
+                        "rolling_summary": "",
+                    }
+
+                # actualizar memoria rolling
+                line = f"[{analysis.get('_meta', {}).get('ts', '')}] {json.dumps(analysis, ensure_ascii=False)}"
+                self._ai_user_mem(user).append(line)
+
+                # guardar rolling summary para continuidad
+                rs = analysis.get("rolling_summary")
+                if isinstance(rs, str) and rs.strip():
+                    self.ai_last_summary[user] = rs.strip()
+
+                # snapshot histórico
+                try:
+                    hist_snapshot = self._ai_build_history_context(user, days=self.ai_hist_days,
+                                                                   top_n=self.ai_hist_top_n)
+                except:
+                    hist_snapshot = {}
+
+                # log diario (mismo archivo jsonl, pero con event_type)
+                self._ai_append_log(user, day, {
+                    "ts": analysis.get("_meta", {}).get("ts"),
+                    "user": user,
+                    "event_type": event_type,
+                    "fname": fname,
+                    "history_snapshot": hist_snapshot,
+                    "analysis": analysis,
+                })
+
+                # alert opcional a jefes
+                flags = analysis.get("risk_flags") or []
+                err = analysis.get("errors_seen") or ""
+                if err or flags:
+                    try:
+                        note = f"IA: {user} | event={event_type} | flags={flags} | err={str(err)[:120]}"
+                        self._broadcast_to_role("jefe", "AI_ALERT|" + note)
+                    except:
+                        pass
+
+            except Exception as e:
+                self.log_to_console(f"AI worker error: {e}", "ERR")
+
+    def _list_activity_dates(self, user: str) -> list:
+        user_dir = os.path.join(self.activity_dir, user)
+        if not os.path.isdir(user_dir):
+            return []
+        dates = []
+        for fn in os.listdir(user_dir):
+            if fn.endswith(".json"):
+                d = fn[:-5]  # YYYY-MM-DD
+                if len(d) == 10 and d[4] == "-" and d[7] == "-":
+                    dates.append(d)
+        dates.sort(reverse=True)
+        return dates
+
+    def _read_activity_day(self, user: str, day: str) -> dict:
+        # Ruta al JSON (ej: basededatos/activity/usuario/2024-02-18.json)
+        path = os.path.join(self.activity_dir, user, f"{day}.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def _ss_tick_and_decide(self, user: str):
+        """
+        Devuelve (should_save, should_forward)
+        Basado en contadores por usuario + (opcional) min segundos.
+        """
+        now = time.time()
+        with self.ss_throttle_lock:
+            st = self.ss_throttle.get(user)
+            if not st:
+                st = {"count": 0, "last_save_ts": 0.0, "last_fwd_ts": 0.0}
+                self.ss_throttle[user] = st
+
+            st["count"] += 1
+            c = st["count"]
+
+            # --- N gating ---
+            should_save = (self.SS_SAVE_EVERY_N <= 1) or (c % self.SS_SAVE_EVERY_N == 0)
+            should_fwd = (self.SS_FWD_EVERY_N <= 1) or (c % self.SS_FWD_EVERY_N == 0)
+
+            # --- time gating (optional) ---
+            if self.SS_MIN_SAVE_SECONDS and should_save:
+                if (now - float(st["last_save_ts"])) < float(self.SS_MIN_SAVE_SECONDS):
+                    should_save = False
+
+            if self.SS_MIN_FWD_SECONDS and should_fwd:
+                if (now - float(st["last_fwd_ts"])) < float(self.SS_MIN_FWD_SECONDS):
+                    should_fwd = False
+
+            # actualizar timestamps si pasa
+            if should_save:
+                st["last_save_ts"] = now
+            if should_fwd:
+                st["last_fwd_ts"] = now
+
+            return should_save, should_fwd
+
+    def load_user_data_to_ram(self):
+        with self.file_lock:
+            self.user_pass_cache.clear()
+            self.user_role_cache.clear()
+
+            if os.path.exists(self.pass_file):
+                with open(self.pass_file, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if ":" in line:
+                            u, p = line.split(":", 1)
+                            if u:
+                                self.user_pass_cache[u] = p
+
+            if os.path.exists(self.role_file):
+                with open(self.role_file, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if ":" in line:
+                            u, r = line.split(":", 1)
+                            if u:
+                                self.user_role_cache[u] = r
+
+    # -------------------------
+    # ✅ COLOR CONSOLA (0-9)
+    # -------------------------
+    def _enable_windows_ansi(self):
+        """
+        Habilita ANSI en Windows (si se puede). Cambios mínimos, sin dependencias.
+        """
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE = -11
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        except:
+            pass
+
+    import shlex
+
+    def _now_ts(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _load_json_safe(self, path: str, default):
+        try:
+            txt = safe_read_text(path).strip()
+            if not txt:
+                return default
+            data = json.loads(txt)
+            return data if data is not None else default
+        except:
+            return default
+
+    def _save_json_atomic_pretty(self, path: str, data: dict):
+        tmp = path + ".tmp"
+        ensure_dir(os.path.dirname(path) or ".")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+    def _norm_kw(self, s: str) -> str:
+        # Normaliza: lower, trim, espacios internos colapsados
+        if s is None:
+            return ""
+        s = str(s).strip().lower()
+        s = " ".join(s.split())
+        return s
+
+    def _default_distraction_keywords(self) -> list:
+        # ✅ Pegá tu lista tal cual (la que mandaste)
+        return [
+            # Social / chat / communities
+            "facebook", "instagram", "threads", "tiktok", "twitter", "x.com", "x (twitter)", "snapchat", "reddit",
+            "9gag",
+            "discord", "whatsapp web", "telegram", "messenger", "signal", "line", "kik", "skype", "wechat",
+            "tinder", "bumble", "hinge", "badoo", "grindr", "meetup",
+
+            # Video / streaming
+            "youtube", "youtube studio", "twitch", "netflix", "prime video", "amazon prime video", "hbo", "hbo max",
+            "max.com",
+            "disney+", "disney plus", "apple tv", "apple tv+", "hulu", "paramount+", "paramount plus", "peacock",
+            "crunchyroll",
+            "pluto tv", "rakuten tv", "movistar plus", "atresplayer", "mitele", "rtve play", "vimeo", "dailymotion",
+
+            # Music / radio
+            "spotify", "soundcloud", "deezer", "apple music", "tidal", "pandora", "iheart", "tunein",
+
+            # Gaming platforms / launchers / stores
+            "steam", "epic games", "epic games launcher", "battle.net", "blizzard", "riot client", "league of legends",
+            "valorant", "fortnite", "roblox", "minecraft", "gta", "grand theft auto", "call of duty", "warzone",
+            "counter-strike", "cs2", "dota", "overwatch", "apex", "pubg", "genshin", "honkai", "runescape",
+            "origin", "ea app", "ubisoft connect", "gog", "itch.io", "xbox", "xbox app", "playstation", "psn",
+            "nintendo",
+            "tetris", "chess.com", "lichess", "miniclip",
+
+            # Shopping / marketplaces
+            "amazon", "amazon.com", "aliexpress", "temu", "shein", "zalando", "asos", "ebay", "etsy", "wallapop",
+            "vinted",
+            "elcorteingles", "zara", "bershka", "pull&bear", "stradivarius", "mango", "hm.com", "h&m", "uniqlo",
+            "nike", "adidas", "under armour", "puma", "decathlon", "ikea", "mediamarkt", "fnac", "carrefour", "lidl",
+            "alcampo", "primor", "druni", "sephora", "ulta", "best buy", "walmart", "target", "costco",
+
+            # News / gossip / time sinks
+            "buzzfeed", "tmz", "people.com", "hola", "lecturas", "semana", "el español", "marca", "as.com", "sport.es",
+            "goal.com", "bleacher report", "espn", "fox sports", "cnn", "bbc", "elpais", "elmundo", "20minutos",
+
+            # Gambling / betting
+            "bet365", "bwin", "william hill", "betfair", "pokerstars", "888poker", "codere", "sportium", "betway",
+            "draftkings", "fanduel",
+
+            # Forums / misc
+            "quora", "stackexchange (non-work)", "imgur", "giphy", "tenor", "memes", "9to5", "lifehacker",
+        ]
+
+    def _load_distraction_config(self) -> dict:
+        """
+        returns:
+          {
+            "version": int,
+            "last_change": str,
+            "keywords": [str, ...]
+          }
+        """
+        meta = self._load_json_safe(self.restrictions_meta_json, default={})
+        version = int(meta.get("version", 1) or 1)
+        last_change = meta.get("last_change") or self._now_ts()
+
+        data = self._load_json_safe(self.distractions_json, default={})
+        kws = data.get("keywords")
+
+        if not isinstance(kws, list) or not kws:
+            # si está vacío, inicializamos con defaults
+            kws = self._default_distraction_keywords()
+            kws = [self._norm_kw(x) for x in kws if self._norm_kw(x)]
+            kws = sorted(list(dict.fromkeys(kws)))  # unique
+            self._save_json_atomic_pretty(self.distractions_json, {"keywords": kws})
+            self._save_json_atomic_pretty(self.restrictions_meta_json, {
+                "version": version,
+                "last_change": last_change
+            })
+
+        else:
+            kws = [self._norm_kw(x) for x in kws if self._norm_kw(x)]
+            kws = sorted(list(dict.fromkeys(kws)))
+
+        return {"version": version, "last_change": last_change, "keywords": kws}
+
+    def _bump_restrictions_version(self) -> dict:
+        meta = self._load_json_safe(self.restrictions_meta_json, default={})
+        v = int(meta.get("version", 1) or 1)
+        v += 1
+        meta["version"] = v
+        meta["last_change"] = self._now_ts()
+        self._save_json_atomic_pretty(self.restrictions_meta_json, meta)
+        return meta
+
+    def _write_distraction_keywords(self, keywords: list):
+        keywords = [self._norm_kw(x) for x in (keywords or []) if self._norm_kw(x)]
+        keywords = sorted(list(dict.fromkeys(keywords)))
+        self._save_json_atomic_pretty(self.distractions_json, {"keywords": keywords})
+
+    def _read_boss_ack(self) -> dict:
+        """
+        boss_terms_ack.txt lines: bossname:0/1
+        """
+        ensure_file(self.boss_terms_txt)
+        txt = safe_read_text(self.boss_terms_txt)
+        ack = {}
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            b, v = line.split(":", 1)
+            b = b.strip()
+            v = v.strip()
+            if b:
+                ack[b] = 1 if v == "1" else 0
+        return ack
+
+    def _pack_restrictions_payload(self) -> str:
+        cfg = self._load_distraction_config()
+        payload = {
+            "type": "distraction_cfg",
+            "version": int(cfg["version"]),
+            "last_change": cfg["last_change"],
+            "keywords": cfg["keywords"],
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _send_restrictions_to_conn(self, connwrap: ClientConn, cfg_json: str):
+        # Protocolo: DISTRACTION_CFG|<json>\n
+        try:
+            connwrap.sendall(f"DISTRACTION_CFG|{cfg_json}\n".encode("utf-8"))
+        except:
+            pass
+
+    def _broadcast_restrictions_if_needed(self):
+        """
+        Se llama cuando hay ADD/DEL real.
+        - Aumenta versión
+        - Marca jefes pendiente (1)
+        - Envía a todos los conectados (clientes)
+        """
+        meta = self._bump_restrictions_version()
+        self._set_all_bosses_pending()
+
+        cfg_json = self._pack_restrictions_payload()
+
+        # Enviar a todos los conectados
+        with self.clients_lock:
+            for cw, info in list(self.clients.items()):
+                try:
+                    self._send_restrictions_to_conn(cw, cfg_json)
+                except:
+                    pass
+
+    def _write_boss_ack(self, ack: dict):
+        lines = []
+        for b, v in (ack or {}).items():
+            if not b:
+                continue
+            lines.append(f"{b}:{1 if int(v) == 1 else 0}")
+        ensure_file(self.boss_terms_txt)
+        with open(self.boss_terms_txt, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+
+    def _set_all_bosses_pending(self):
+        """
+        Cuando cambia algo, todos los jefes quedan con 1 (pendiente).
+        """
+        # sacamos jefes desde roles.txt
+        bosses = [u for u, r in self.user_role_cache.items() if str(r).lower() == "jefe"]
+        ack = self._read_boss_ack()
+        for b in bosses:
+            ack[b] = 1
+        self._write_boss_ack(ack)
+
+    def _mark_boss_ack_0(self, boss_user: str):
+        ack = self._read_boss_ack()
+        ack[boss_user] = 0
+        self._write_boss_ack(ack)
+
+    def _ansi_color(self, n: int) -> str:
+        """
+        Mapeo simple 0-9 estilo consola.
+        0: reset
+        1..9: colores básicos (aprox CMD)
+        """
+        mapping = {
+            0: "\033[0m",  # reset
+            1: "\033[37m",  # blanco/gris
+            2: "\033[32m",  # verde
+            3: "\033[36m",  # cian
+            4: "\033[31m",  # rojo
+            5: "\033[35m",  # magenta
+            6: "\033[33m",  # amarillo
+            7: "\033[34m",  # azul
+            8: "\033[90m",  # gris oscuro
+            9: "\033[97m",  # blanco brillante
+        }
+        return mapping.get(int(n), "\033[0m")
+
+    def set_console_color(self, n: int):
+        try:
+            n = int(n)
+        except:
+            n = 0
+        if n < 0 or n > 9:
+            n = 0
+        self.console_default_color = n
+        # aplica inmediatamente
+        sys.stdout.write(self._ansi_color(n))
+        sys.stdout.flush()
+
+    def printc(self, n: int, text: str, end="\n"):
+        """
+        Imprime en color n sin cambiar el default.
+        """
+        try:
+            n = int(n)
+        except:
+            n = 0
+        if n < 0 or n > 9:
+            n = 0
+        sys.stdout.write(self._ansi_color(n) + str(text) + self._ansi_color(self.console_default_color) + end)
+        sys.stdout.flush()
+
+    # -------------------------
+    # LOGS
+    # -------------------------
+    def log_to_console(self, msg, tag="INFO"):
+        ts = datetime.now().strftime("%H:%M:%S")
+        # ✅ respeta color default
+        print(f"[{ts}] [{tag}] {msg}")
+
+    def log_session(self, user, action):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        safe_append(self.session_log_file, f"{ts}|{user}|{action}\n", self.file_lock)
+
+    def save_command_log(self, executor, cmd):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        safe_append(self.command_log_file, f"[{ts}] Ejecutor: {executor} | Comando: {cmd}\n", self.file_lock)
+
+    # -------------------------
+    # ✅ PERSISTENCIA STATE (JSON)
+    # -------------------------
+    def _week_id_now(self) -> str:
+        # ISO week
+        iso = datetime.now().isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"
+
+    def _load_state(self) -> dict:
+        with self.file_lock:
+            try:
+                if os.path.exists(self.state_file):
+                    txt = safe_read_text(self.state_file).strip()
+                    if txt:
+                        data = json.loads(txt)
+                        if isinstance(data, dict):
+                            return data
+            except:
+                pass
+        # default
+        return {
+            "meta": {
+                "week_id": self._week_id_now(),
+                "last_save": None,
+                "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            "users": {}
+        }
+
+    def _save_state(self):
+        # atomic
+        with self.file_lock:
+            try:
+                self.state.setdefault("meta", {})
+                self.state["meta"]["last_save"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                tmp = self.state_file + ".tmp"
+                ensure_dir(os.path.dirname(self.state_file) or ".")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.state, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, self.state_file)
+            except Exception as e:
+                self.log_to_console(f"Error guardando state: {e}", "ERR")
+
+    def _ensure_state_users(self):
+        self.state.setdefault("users", {})
+        for u in list(self.user_pass_cache.keys()):
+            if u not in self.state["users"]:
+                self.state["users"][u] = {
+                    "lifetime_active": 0,
+                    "lifetime_inactive": 0,
+                    "weekly_active": 0,
+                    "weekly_inactive": 0,
+                    "prev_week": None,  # snapshot {week_id, weekly_active, weekly_inactive, kpi_est, top_distractions}
+                    "last_seen": None,
+                    "last_ping_ms": None,
+                }
+        # también limpiar usuarios inexistentes? NO lo hago por seguridad (no borro nada)
+
+    def _rotate_if_week_changed(self):
+        current = self._week_id_now()
+        meta = self.state.get("meta", {})
+        stored = meta.get("week_id", current)
+        if stored != current:
+            # rotación elegante: guardar prev_week por usuario y resetear weekly
+            self._rotate_weekly_stats(stored_week_id=stored, new_week_id=current)
+            self.state["meta"]["week_id"] = current
+            self._save_state()
+
+    def _rotate_weekly_stats(self, stored_week_id: str, new_week_id: str):
+        """
+        Guarda weekly actual en prev_week y resetea weekly_*.
+        NO toca lifetime.
+        """
+        users = self.state.get("users", {})
+        for u, ud in users.items():
+            prev = {
+                "week_id": stored_week_id,
+                "weekly_active": int(ud.get("weekly_active", 0)),
+                "weekly_inactive": int(ud.get("weekly_inactive", 0)),
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            ud["prev_week"] = prev
+            ud["weekly_active"] = 0
+            ud["weekly_inactive"] = 0
+        self.log_to_console(f"Rotación semanal OK: {stored_week_id} -> {new_week_id}", "RESET")
+
+    def _state_add_time(self, user: str, category: str, seconds: int):
+        """
+        category: 'activo' / 'inactivo'
+        Actualiza lifetime + weekly.
+        """
+        self._ensure_state_users()
+        ud = self.state["users"].setdefault(user, {})
+        seconds = int(seconds) if seconds else 0
+        if seconds < 0:
+            seconds = 0
+
+        if category == "activo":
+            ud["lifetime_active"] = int(ud.get("lifetime_active", 0)) + seconds
+            ud["weekly_active"] = int(ud.get("weekly_active", 0)) + seconds
+        else:
+            ud["lifetime_inactive"] = int(ud.get("lifetime_inactive", 0)) + seconds
+            ud["weekly_inactive"] = int(ud.get("weekly_inactive", 0)) + seconds
+
+        ud["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _get_times_from_state_weekly(self, user: str):
+        self._ensure_state_users()
+        ud = self.state["users"].get(user, {})
+        act = int(ud.get("weekly_active", 0))
+        ina = int(ud.get("weekly_inactive", 0))
+        return self.seconds_to_dhms(act), self.seconds_to_dhms(ina)
+
+    def _get_times_from_state_lifetime(self, user: str):
+        self._ensure_state_users()
+        ud = self.state["users"].get(user, {})
+        act = int(ud.get("lifetime_active", 0))
+        ina = int(ud.get("lifetime_inactive", 0))
+        return self.seconds_to_dhms(act), self.seconds_to_dhms(ina)
+
+    # -------------------------
+    # TIEMPOS (legacy + persistente)
+    # -------------------------
+    def update_user_time_file(self, user, category, seconds=5):
+        """
+        ✅ Se mantiene para compatibilidad.
+        Antes solo escribía stats_dir y se perdía con reset/reinicio.
+        Ahora:
+          1) Actualiza persistencia (NO se pierde)
+          2) Sigue escribiendo el archivo legacy (por si algo lo usa)
+        """
+        # 1) persistencia
+        self._state_add_time(user, category, seconds)
+
+        # 2) legacy file (NO se borra compat)
+        ensure_dir(self.stats_dir)
+        path = os.path.join(self.stats_dir, f"{user}_times.txt")
+        data = {"activo": 0, "inactivo": 0}
+
+        with self.file_lock:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if ":" in line:
+                                k, v = line.strip().split(":", 1)
+                                if k in data:
+                                    data[k] = int(v)
+                except:
+                    pass
+
+            data[category] = data.get(category, 0) + seconds
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"activo:{data['activo']}\n")
+                f.write(f"inactivo:{data['inactivo']}\n")
+
+    def get_persisted_times(self, user):
+        """
+        ✅ FIX: ya NO dependemos del archivo que se borra en reset semanal.
+        Devuelve WEEKLY (como antes se reseteaba por semana).
+        """
+        try:
+            return self._get_times_from_state_weekly(user)
+        except:
+            return "0d 0h 0m", "0d 0h 0m"
+
+    def seconds_to_dhms(self, seconds):
+        d, rem = divmod(int(seconds), 86400)
+        h, rem = divmod(rem, 3600)
+        m, _ = divmod(rem, 60)
+        return f"{d}d {h}h {m}m"
+
+    # -------------------------
+    # WEEKLY RESET
+    # -------------------------
+    def perform_weekly_reset(self):
+        """
+        ✅ Mantiene tu mantenimiento original (archivar capturas, diary, etc)
+        ✅ PERO YA NO “pierde” stats por reinicio:
+           - weekly se rota a prev_week
+           - lifetime se conserva
+        """
+        with self.file_lock:
+            try:
+                # antes de hacer cosas, rotar si corresponde
+                old_week = self.state.get("meta", {}).get("week_id", self._week_id_now())
+                new_week = self._week_id_now()
+                if old_week != new_week:
+                    # ya cambió semana, rotamos
+                    self._rotate_weekly_stats(stored_week_id=old_week, new_week_id=new_week)
+                    self.state["meta"]["week_id"] = new_week
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+
+                backup_week_dir = os.path.join(self.backups_dir, f"capturas_{timestamp}")
+                ensure_dir(backup_week_dir)
+
+                count_imgs = 0
+                for f in os.listdir(self.capturas_dir):
+                    src = os.path.join(self.capturas_dir, f)
+                    if os.path.isfile(src):
+                        try:
+                            shutil.move(src, os.path.join(backup_week_dir, f))
+                            count_imgs += 1
+                        except:
+                            pass
+
+                existentes = [f for f in os.listdir(self.diary_dir) if f.startswith("week_")]
+                num_semana = len(existentes) + 1
+                diary_path = os.path.join(self.diary_dir, f"week_{num_semana}_{timestamp}.txt")
+
+                reporte = f"--- REPORTE SEMANAL - SEMANA {num_semana} ---\n"
+                reporte += f"Fecha de cierre: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                reporte += f"Capturas archivadas: {count_imgs}\n"
+                reporte += f"Week ID: {self.state.get('meta', {}).get('week_id', self._week_id_now())}\n"
+                reporte += "-" * 50 + "\n"
+
+                for user in self.user_pass_cache.keys():
+                    # Weekly (porque es el reporte semanal)
+                    t_act, t_ina = self.get_persisted_times(user)
+                    reporte += f"USUARIO: {user:<15} | ACTIVO: {t_act:<12} | INACTIVO: {t_ina:<12}\n"
+
+                ensure_file(diary_path)
+                with open(diary_path, "w", encoding="utf-8") as f:
+                    f.write(reporte)
+
+                # ✅ ANTES: borrabas stats_dir completo (y se perdía todo)
+                # Ahora: lo dejo igual para no cambiar tu comportamiento "visual" legacy,
+                # pero ya NO importa porque los números reales están en data/server_state.json
+                for f in os.listdir(self.stats_dir):
+                    try:
+                        os.remove(os.path.join(self.stats_dir, f))
+                    except:
+                        pass
+
+                # guardar state
+                self._save_state()
+
+                self.log_to_console(f"Reset semanal OK. {count_imgs} capturas archivadas.", "RESET")
+                return f"Éxito: Reporte y {count_imgs} fotos archivadas."
+            except Exception as e:
+                return f"Error en mantenimiento: {e}"
+
+    def weekly_reset_loop(self):
+        while self.is_running:
+            now = datetime.now()
+            # sábado 00:00
+            if now.weekday() == 5 and now.hour == 0 and now.minute == 0:
+                self.perform_weekly_reset()
+                time.sleep(61)
+            time.sleep(30)
+
+    # -------------------------
+    # ACTIVIDAD V2 (JSON FG/BG)
+    # -------------------------
+    def _day_str_now(self):
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _activity_day_path(self, user: str, day_str: str):
+        user_dir = os.path.join(self.activity_dir, user)
+        ensure_dir(user_dir)
+        return os.path.join(user_dir, f"{day_str}.json")
+
+    def _load_activity_day(self, path: str) -> dict:
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except:
+            pass
+        return {}
+
+    def _save_json_atomic(self, path: str, data: dict):
+        tmp = path + ".tmp"
+        ensure_dir(os.path.dirname(path) or ".")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+
+    def _merge_activity_delta(self, store: dict, delta: dict):
+        if not isinstance(delta, dict):
+            return
+        for app, v in delta.items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                fg = float(v.get("fg", 0.0))
+            except:
+                fg = 0.0
+            try:
+                bg = float(v.get("bg", 0.0))
+            except:
+                bg = 0.0
+
+            if not app:
+                app = "Sistema"
+            if app not in store:
+                store[app] = {"fg": 0.0, "bg": 0.0}
+            store[app]["fg"] = float(store[app].get("fg", 0.0)) + fg
+            store[app]["bg"] = float(store[app].get("bg", 0.0)) + bg
+
+    def ingest_activity_v2(self, user: str, payload: dict):
+        day_str = self._day_str_now()
+        path = self._activity_day_path(user, day_str)
+
+        delta = payload.get("delta", {})
+        with self.file_lock:
+            store = self._load_activity_day(path)
+            self._merge_activity_delta(store, delta)
+            self._save_json_atomic(path, store)
+
+    def ensure_daily_activity_json_for_all_users(self):
+        day_str = self._day_str_now()
+        with self.file_lock:
+            for user in list(self.user_pass_cache.keys()):
+                p = self._activity_day_path(user, day_str)
+                if not os.path.exists(p):
+                    self._save_json_atomic(p, {})
+
+    def _sum_activity_v2_days(self, user: str, days: int = 1) -> dict:
+        """
+        Devuelve total: app -> {fg, bg} sumado de últimos N días.
+        """
+        total = {}
+        for i in range(max(1, int(days))):
+            day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            path = self._activity_day_path(user, day)
+            day_data = self._load_activity_day(path)
+            self._merge_activity_delta(total, day_data)
+        return total
+
+    def analyze_activity_v2(self, user: str, days: int = 1, top_n: int = 10) -> str:
+        total = self._sum_activity_v2_days(user, days=days)
+
+        if not total:
+            return "Sin datos (V2)"
+
+        fg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
+        bg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
+
+        def fmt(sec: float):
+            try:
+                sec = int(sec)
+            except:
+                sec = 0
+            m, s = divmod(sec, 60)
+            h, m = divmod(m, 60)
+            d, h = divmod(h, 24)
+            if d > 0:
+                return f"{d}d {h}h {m}m"
+            return f"{h}h {m}m"
+
+        out = "\n"
+        out += "TOP FOREGROUND (en foco)\n"
+        out += "-" * 28 + "\n"
+        for app, v in fg_sorted[:top_n]:
+            out += f" > {app[:35]:<35} [{fmt(v.get('fg', 0.0))}]\n"
+
+        out += "\nTOP BACKGROUND (abierta)\n"
+        out += "-" * 28 + "\n"
+        for app, v in bg_sorted[:top_n]:
+            out += f" > {app[:35]:<35} [{fmt(v.get('bg', 0.0))}]\n"
+
+        return out
+
+    # -------------------------
+    # HISTORIAL V1 (legacy)
+    # -------------------------
+    def analyze_history(self, user):
+        path = os.path.join(self.db_dir, f"{user}.txt")
+        if not os.path.exists(path):
+            return "Sin datos"
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [l.strip() for l in f if l.strip()]
+            counts = Counter(lines)
+            res = "\n"
+            for app, count in counts.most_common(15):
+                total_sec = count * 5
+                m, s = divmod(total_sec, 60)
+                h, m = divmod(m, 60)
+                res += f" > {app[:35]:<35} [{h}h {m}m]\n"
+            return res
+        except:
+            return "Sin datos"
+
+    # -------------------------
+    # PARSER ROBUSTO
+    # -------------------------
+    def _recv_exact(self, sock: socket.socket, n: int, timeout=20.0) -> bytes:
+        sock.settimeout(timeout)
+        data = bytearray()
+        while len(data) < n:
+            chunk = sock.recv(min(16384, n - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
+
+    def _readline_from_buffer(self, buffer: bytearray):
+        idx = buffer.find(b"\n")
+        if idx == -1:
+            return None
+        line = bytes(buffer[:idx])
+        del buffer[:idx + 1]
+        return line
+
+    # -------------------------
+    # CLIENT HANDLER
+    # -------------------------
+    def handle_client(self, conn: socket.socket, addr):
+        connwrap = ClientConn(conn, addr)
+        user_associated = None
+
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.settimeout(20.0)
+
+            data = conn.recv(1024)
+            if not data:
+                return
+            try:
+                text = data.decode("utf-8", errors="ignore").strip()
+            except:
+                return
+
+            if "," not in text:
+                return
+
+            user, password = text.split(",", 1)
+
+            if self.user_pass_cache.get(user) != password:
+                try:
+                    connwrap.sendall(b"DENIED\n")
+                except:
+                    pass
+                return
+
+            user_role = self.user_role_cache.get(user, "empleado")
+            connwrap.sendall(f"OK,{user_role}\n".encode("utf-8"))
+
+            self.log_to_console(f"LOGIN: {user} ({user_role}) desde {addr}", "AUTH")
+            self.log_session(user, "LOGIN")
+
+            with self.clients_lock:
+                self.clients[connwrap] = {"name": user, "addr": addr, "role": user_role}
+            # ✅ Si es JEFE y está pendiente (1), le mandamos la config actual y marcamos 0
+            if str(user_role).lower() == "jefe":
+                try:
+                    ack = self._read_boss_ack()
+                    pending = int(ack.get(user, 0))
+                    if pending == 1:
+                        cfg_json = self._pack_restrictions_payload()
+                        self._send_restrictions_to_conn(connwrap, cfg_json)
+                        self._mark_boss_ack_0(user)
+                except:
+                    pass
+
+            user_associated = user
+            with self.last_lock:
+                self.last_activity[user] = datetime.now()
+
+            # estado persistente
+            self._ensure_state_users()
+            self.state["users"][user]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            buf = bytearray()
+
+            while self.is_running and connwrap.alive:
+                try:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+
+                    while True:
+                        line = self._readline_from_buffer(buf)
+                        if line is None:
+                            break
+
+                        msg_item = line.decode("utf-8", errors="ignore").strip()
+                        msg_item = re.sub(r"[\x00-\x1F\x7F]", "", msg_item).strip()
+                        if not msg_item or msg_item == "ALIVE_PING" or msg_item == "\x00":
+                            continue
+
+                        with self.last_lock:
+                            self.last_activity[user] = datetime.now()
+                        # =========================
+                        # ✅ GOOGLE CALENDAR -> TASK STORE (nuevo)
+                        # Cliente manda:
+                        #   TASK_GOOGLE_CALENDAR|<user>|<YYYY-MM-DD>|<json_completo>
+                        # Guarda en tasks del usuario (append) y notifica a jefes
+                        # =========================
+                        # =========================
+                        # ✅ GOOGLE CALENDAR (ROBUSTO): header + bytes
+                        # Cliente manda:
+                        #   TASK_GOOGLE_CALENDAR2|<user>|<YYYY-MM-DD>|<len>\n
+                        #   <json_bytes>
+                        # =========================
+                        if msg_item.startswith("TASK_GOOGLE_CALENDAR2|"):
+                            try:
+                                # Formato esperado (ideal):
+                                #   TASK_GOOGLE_CALENDAR2|<user>|<date>|<LEN>\n
+                                #   <JSON bytes...>
+                                #
+                                # Pero si llega "mal" puede venir:
+                                #   TASK_GOOGLE_CALENDAR2|<user>|<date>|{...json...}
+
+                                _, target_user, date_str, tail = msg_item.split("|", 3)
+
+                                target_user = (target_user or "").strip() or user
+                                date_str = (date_str or "").strip()
+                                tail = (tail or "").strip()
+
+                                data = None
+
+                                # ✅ Caso A: viene JSON inline (sin LEN)
+                                if tail.startswith("{") or tail.startswith("["):
+                                    data = json.loads(tail)
+
+                                else:
+                                    # ✅ Caso B: viene LEN, y luego bytes del JSON
+                                    # (si tail tiene cosas raras como \n al final, strip ya lo limpió)
+                                    n = int(tail)
+
+                                    # leer exactamente n bytes (pueden venir ya en buf)
+                                    raw_bytes = bytearray()
+
+                                    if len(buf) > 0:
+                                        take = min(len(buf), n)
+                                        raw_bytes.extend(buf[:take])
+                                        del buf[:take]
+
+                                    if len(raw_bytes) < n:
+                                        raw_bytes.extend(self._recv_exact(conn, n - len(raw_bytes), timeout=20.0))
+
+                                    # decodificar JSON
+                                    raw_json = raw_bytes.decode("utf-8", errors="strict")
+                                    data = json.loads(raw_json)
+
+                                # ✅ Normalizar evento/summary
+                                ev = data.get("event", {}) if isinstance(data, dict) else {}
+                                if not isinstance(ev, dict):
+                                    ev = {}
+
+                                task_id = (
+                                        ev.get("id")
+                                        or (data.get("id") if isinstance(data, dict) else None)
+                                        or str(uuid.uuid4())
+                                )
+
+                                title = (
+                                        ev.get("summary")
+                                        or (data.get("summary") if isinstance(data, dict) else None)
+                                        or "Google Calendar event"
+                                )
+
+                                task_obj = {
+                                    "id": task_id,
+                                    "source": "google_calendar",
+                                    "date": date_str,
+                                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "assignee": target_user,
+                                    "title": title,
+                                    "raw": data
+                                }
+
+                                # ✅ Guardar evitando duplicados
+                                added = False
+                                with self.tasks_lock:
+                                    tasks_list = self._load_user_tasks(target_user)
+                                    existing_ids = {
+                                        t.get("id")
+                                        for t in tasks_list
+                                        if isinstance(t, dict) and t.get("id")
+                                    }
+                                    if task_obj["id"] not in existing_ids:
+                                        tasks_list.append(task_obj)
+                                        self._save_user_tasks(target_user, tasks_list)
+                                        added = True
+
+                                # ✅ Encolar IA solo si se agregó
+                                if added:
+                                    try:
+                                        with self.ai_queue_lock:
+                                            self.ai_queue.append({
+                                                "type": "task",
+                                                "event_type": "task_google_calendar",
+                                                "user": target_user,
+                                                "task": task_obj,
+                                                "fname": "",
+                                                "day": self._ai_day_str()
+                                            })
+                                    except Exception as e:
+                                        self.log_to_console(f"No se pudo encolar IA (task): {e}", "ERR")
+
+                                # ✅ Aviso en consola a jefes
+                                try:
+                                    note = f"GC2 event {'guardado' if added else 'duplicado'} para {target_user}: {task_obj['title']}"
+                                    self._broadcast_to_role("jefe", "CONSOLE_OUTPUT|" + note)
+                                except:
+                                    pass
+
+                            except Exception as e:
+                                self.log_to_console(f"Error TASK_GOOGLE_CALENDAR2: {e}", "ERR")
+                            continue
+
+                        # ========== JSON PAYLOADS (V2) ==========
+                        if msg_item.startswith("JSON|"):
+                            try:
+                                payload = json.loads(msg_item[5:])
+                                if isinstance(payload, dict) and payload.get("type") == "activity_v2":
+                                    self.ingest_activity_v2(user, payload)
+                            except Exception as e:
+                                self.log_to_console(f"Error JSON: {e}", "ERR")
+                            continue
+                        # =========================
+                        # ✅ JEFE PIDE RESUMEN SEMANAL / ÚLTIMOS N DÍAS
+                        # Cliente manda: AI_SUMMARY_REQ|<user>|<days>
+                        # Server responde: AI_SUMMARY_DATA|<user>|<days>|<bytes>\n + bytes
+                        # =========================
+                        if msg_item.startswith("AI_SUMMARY_REQ|"):
+                            parts = msg_item.split("|")
+                            target_user = parts[1].strip() if len(parts) >= 2 else ""
+                            days = 7
+                            if len(parts) >= 3:
+                                try:
+                                    days = int(parts[2])
+                                except:
+                                    days = 7
+
+                            # solo jefes
+                            if str(user_role).lower() != "jefe":
+                                try:
+                                    connwrap.sendall(b"CONSOLE_OUTPUT|Error: solo jefes pueden pedir AI summaries.\n")
+                                except:
+                                    pass
+                                continue
+
+                            if not target_user:
+                                target_user = user
+
+                            try:
+                                summary_text = self._ai_week_summary_text(target_user, days=days)
+                            except Exception as e:
+                                summary_text = f"(error generando resumen: {e})"
+
+                            payload = (summary_text + "\n").encode("utf-8", errors="ignore")
+                            try:
+                                header = f"AI_SUMMARY_DATA|{target_user}|{days}|{len(payload)}\n".encode("utf-8")
+                                connwrap.sendall(header + payload)
+                            except:
+                                pass
+                            continue
+
+                        # =========================
+                        # ✅ CLIENTE PIDE CFG SI LA NECESITA
+                        # Cliente manda: CFG_VERSION|<int>
+                        # Server responde SOLO si version_server > version_cliente
+                        # =========================
+                        if msg_item.startswith("CFG_VERSION|"):
+                            try:
+                                ver_client = int(msg_item.split("|", 1)[1].strip() or "0")
+                            except:
+                                ver_client = 0
+                            cfg = self._load_distraction_config()
+                            if int(cfg["version"]) > ver_client:
+                                cfg_json = self._pack_restrictions_payload()
+                                self._send_restrictions_to_conn(connwrap, cfg_json)
+                            continue
+                        # =========================
+                        # ✅ RENDIMIENTO: pedir fechas disponibles
+                        # Cliente manda: HIST_DATES_REQ|<user>
+                        # Server responde: HIST_DATES|<user>|date1,date2,...
+                        # =========================
+                        if msg_item.startswith("HIST_DATES_REQ|"):
+                            target_user = msg_item.split("|", 1)[1].strip() or user
+                            dates = self._list_activity_dates(target_user)
+                            try:
+                                connwrap.sendall(f"HIST_DATES|{target_user}|{','.join(dates)}\n".encode("utf-8"))
+                            except:
+                                pass
+                            continue
+                        # =========================
+                        # ✅ JEFE PIDE LOG IA
+                        # Cliente manda: AI_LOG_REQ|<user>|<YYYY-MM-DD>|<max_lines>
+                        # Server responde: AI_LOG_DATA|<user>|<date>|<bytes>\n + bytes
+                        # =========================
+                        if msg_item.startswith("AI_LOG_REQ|"):
+                            parts = msg_item.split("|")
+                            target_user = parts[1].strip() if len(parts) >= 2 else ""
+                            day = parts[2].strip() if len(parts) >= 3 and parts[2].strip() else self._ai_day_str()
+                            max_lines = 300
+                            if len(parts) >= 4:
+                                try:
+                                    max_lines = int(parts[3])
+                                except:
+                                    max_lines = 300
+
+                            # solo jefes
+                            if str(user_role).lower() != "jefe":
+                                try:
+                                    connwrap.sendall(b"CONSOLE_OUTPUT|Error: solo jefes pueden pedir AI logs.\n")
+                                except:
+                                    pass
+                                continue
+
+                            fp = self._ai_log_path(target_user, day)
+                            if not os.path.exists(fp):
+                                payload = f"(sin log IA para {target_user} en {day})\n".encode("utf-8")
+                            else:
+                                try:
+                                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                                        lines = f.readlines()
+                                    lines = lines[-max_lines:]
+                                    payload = "".join(lines).encode("utf-8")
+                                except:
+                                    payload = f"(error leyendo log IA {target_user} {day})\n".encode("utf-8")
+
+                            try:
+                                header = f"AI_LOG_DATA|{target_user}|{day}|{len(payload)}\n".encode("utf-8")
+                                connwrap.sendall(header + payload)
+                            except:
+                                pass
+                            continue
+
+                        # =========================
+                        # ✅ RENDIMIENTO: pedir día específico
+                        # Cliente manda: HIST_GET|<user>|<YYYY-MM-DD>
+                        # Server responde: HIST_DATA|<user>|<YYYY-MM-DD>|<json>
+                        # =========================
+                        if msg_item.startswith("HIST_GET|"):
+                            parts = msg_item.split("|")
+                            if len(parts) >= 3:
+                                target_user = (parts[1].strip() or user)
+                                day = parts[2].strip()
+                                data = self._read_activity_day(target_user, day)
+                                try:
+                                    payload = json.dumps(data, ensure_ascii=False)
+                                    connwrap.sendall(f"HIST_DATA|{target_user}|{day}|{payload}\n".encode("utf-8"))
+                                except:
+                                    pass
+                            continue
+
+                        # =========================
+                        # ✅ TAREAS (SYNC)
+                        # =========================
+                        # Cliente manda:
+                        #   TASKS_SYNC_REQ|<req_id>|<target_user_or_ALL>
+                        # Server responde:
+                        #   TASKS_SYNC|<req_id>|<json>
+                        # Broadcast eventos:
+                        #   TASK_EVT|<json>
+                        if msg_item.startswith("TASKS_SYNC_REQ|"):
+                            parts = msg_item.split("|", 2)
+                            req_id = parts[1].strip() if len(parts) > 1 else ""
+                            target = parts[2].strip() if len(parts) > 2 else ""
+                            if not target:
+                                target = user
+
+                            if target.upper() == "ALL":
+                                # Solo jefes pueden pedir ALL
+                                if str(user_role).lower() != "jefe":
+                                    target = user
+
+                            with self.tasks_lock:
+                                if target.upper() == "ALL":
+                                    payload = {"type": "tasks_sync", "scope": "ALL", "by_user": {}}
+                                    # por cada user conocido (roles + historial) intentamos cargar tasks
+                                    known = set(self.user_pass_cache.keys()) | set(self.user_role_cache.keys())
+                                    # también incluir conectados
+                                    with self.clients_lock:
+                                        for _, info in self.clients.items():
+                                            if info.get("name"):
+                                                known.add(info["name"])
+                                    for u in sorted(known):
+                                        payload["by_user"][u] = self._load_user_tasks(u)
+                                else:
+                                    payload = {"type": "tasks_sync", "scope": "USER", "user": target,
+                                               "tasks": self._load_user_tasks(target)}
+
+                            try:
+                                j = json.dumps(payload, ensure_ascii=False)
+                                connwrap.sendall(f"TASKS_SYNC|{req_id}|{j}\n".encode("utf-8"))
+                            except:
+                                pass
+                            continue
+
+                        # Cliente manda:
+                        #   TASK_EVT|<json>
+                        # json:
+                        #   {action, task, task_id, assignee, actor, boss_name?}
+                        if msg_item.startswith("TASK_EVT|"):
+                            raw = msg_item.split("|", 1)[1].strip()
+                            try:
+                                evt = json.loads(raw)
+                            except:
+                                evt = None
+                            if not isinstance(evt, dict):
+                                continue
+
+                            action = (evt.get("action") or "").lower()
+                            assignee = (evt.get("assignee") or (evt.get("task") or {}).get("assignee") or "").strip()
+                            actor = (evt.get("actor") or user).strip() or user
+                            evt["actor"] = actor
+
+                            if not assignee:
+                                # si no hay asignado, no sabemos dónde guardar; ignoramos
+                                continue
+
+                            with self.tasks_lock:
+                                tasks_list = self._load_user_tasks(assignee)
+
+                                def find_idx(tid: str):
+                                    for k, t in enumerate(tasks_list):
+                                        if isinstance(t, dict) and (t.get("id") == tid):
+                                            return k
+                                    return -1
+
+                                if action in ("create", "add", "added"):
+                                    task = evt.get("task") if isinstance(evt.get("task"), dict) else {}
+                                    tid = task.get("id") or evt.get("task_id") or str(uuid.uuid4())
+                                    task["id"] = tid
+                                    task["assignee"] = assignee
+                                    tasks_list.append(task)
+                                    evt["task_id"] = tid
+                                    evt["task"] = task
+
+                                elif action in ("update", "edit"):
+                                    task = evt.get("task") if isinstance(evt.get("task"), dict) else {}
+                                    tid = task.get("id") or evt.get("task_id")
+                                    if not tid:
+                                        continue
+                                    idx = find_idx(tid)
+                                    if idx >= 0:
+                                        # merge
+                                        cur = tasks_list[idx]
+                                        if isinstance(cur, dict):
+                                            cur.update(task)
+                                            cur["id"] = tid
+                                            cur["assignee"] = assignee
+                                            tasks_list[idx] = cur
+                                            evt["task"] = cur
+                                        else:
+                                            tasks_list[idx] = task
+                                            evt["task"] = task
+                                    else:
+                                        task["id"] = tid
+                                        task["assignee"] = assignee
+                                        tasks_list.append(task)
+                                        evt["task"] = task
+                                        evt["task_id"] = tid
+
+                                elif action in ("delete", "remove"):
+                                    tid = evt.get("task_id") or (evt.get("task") or {}).get("id")
+                                    if not tid:
+                                        continue
+                                    idx = find_idx(tid)
+                                    if idx >= 0:
+                                        tasks_list.pop(idx)
+                                    evt["task_id"] = tid
+
+                                elif action in ("finish", "done", "completed"):
+                                    tid = evt.get("task_id") or (evt.get("task") or {}).get("id")
+                                    if not tid:
+                                        continue
+                                    idx = find_idx(tid)
+                                    if idx >= 0 and isinstance(tasks_list[idx], dict):
+                                        tasks_list[idx]["done"] = True
+                                        tasks_list[idx]["status"] = "done"
+                                        evt["task"] = tasks_list[idx]
+                                    evt["task_id"] = tid
+
+                                # guardar siempre
+                                self._save_user_tasks(assignee, tasks_list)
+
+                            # broadcast a todos los jefes + al empleado asignado
+                            try:
+                                out = "TASK_EVT|" + json.dumps(evt, ensure_ascii=False)
+                                self._broadcast_to_role("jefe", out)
+                                self._send_to_user_if_online(assignee, out)
+
+                                # notificación para el empleado
+                                boss_name = (evt.get("boss") or evt.get("boss_name") or actor)
+                                msg_txt = ""
+                                if action in ("create", "add", "added"):
+                                    title = ((evt.get("task") or {}).get("title") or (evt.get("task") or {}).get(
+                                        "name") or "tarea")
+                                    msg_txt = f"{boss_name} te añadió: {title}"
+                                elif action in ("update", "edit"):
+                                    msg_txt = f"{boss_name} editó una tarea tuya."
+                                elif action in ("delete", "remove"):
+                                    msg_txt = f"{boss_name} eliminó una tarea tuya."
+                                elif action in ("finish", "done", "completed"):
+                                    msg_txt = f"{boss_name} marcó una tarea como finalizada."
+                                if msg_txt:
+                                    self._send_to_user_if_online(assignee, f"SHOW_POPUP|Tareas|{msg_txt}")
+                            except:
+                                pass
+                            continue
+
+                        # =========================
+                        # ✅ PREMIOS (SYNC)
+                        # =========================
+                        # Cliente manda:
+                        #   REWARDS_SYNC_REQ|<req_id>|<target_user_or_ALL>
+                        # Server responde:
+                        #   REWARDS_SYNC|<req_id>|<json>
+                        if msg_item.startswith("REWARDS_SYNC_REQ|"):
+                            parts = msg_item.split("|", 2)
+                            req_id = parts[1].strip() if len(parts) > 1 else ""
+                            target = parts[2].strip() if len(parts) > 2 else ""
+                            if not target:
+                                target = user
+
+                            if target.upper() == "ALL":
+                                if str(user_role).lower() != "jefe":
+                                    target = user
+
+                            with self.rewards_lock:
+                                if target.upper() == "ALL":
+                                    payload = {"type": "rewards_sync", "scope": "ALL", "by_user": {}}
+                                    known = set(self.user_pass_cache.keys()) | set(self.user_role_cache.keys())
+                                    with self.clients_lock:
+                                        for _, info in self.clients.items():
+                                            if info.get("name"):
+                                                known.add(info["name"])
+                                    for u in sorted(known):
+                                        payload["by_user"][u] = self._load_user_rewards(u)
+                                else:
+                                    payload = {"type": "rewards_sync", "scope": "USER", "user": target,
+                                               "rewards": self._load_user_rewards(target)}
+
+                            try:
+                                j = json.dumps(payload, ensure_ascii=False)
+                                connwrap.sendall(f"REWARDS_SYNC|{req_id}|{j}\n".encode("utf-8"))
+                            except:
+                                pass
+                            continue
+
+                        # Cliente manda:
+                        #   REWARD_EVT|<json>
+                        if msg_item.startswith("REWARD_EVT|"):
+                            raw = msg_item.split("|", 1)[1].strip()
+                            try:
+                                evt = json.loads(raw)
+                            except:
+                                evt = None
+                            if not isinstance(evt, dict):
+                                continue
+
+                            action = (evt.get("action") or "").lower()
+                            to_user = (evt.get("to") or evt.get("user") or "").strip()
+                            actor = (evt.get("from") or evt.get("actor") or user).strip() or user
+                            evt["from"] = actor
+
+                            if not to_user:
+                                continue
+
+                            with self.rewards_lock:
+                                rewards_list = self._load_user_rewards(to_user)
+                                if action in ("award", "add", "create"):
+                                    rid = evt.get("id") or str(uuid.uuid4())
+                                    evt["id"] = rid
+                                    evt.setdefault("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                                    evt.setdefault("seen", False)
+                                    rewards_list.append(evt)
+                                elif action in ("mark_seen", "seen"):
+                                    rid = evt.get("id")
+                                    if rid:
+                                        for r in rewards_list:
+                                            if isinstance(r, dict) and r.get("id") == rid:
+                                                r["seen"] = True
+                                self._save_user_rewards(to_user, rewards_list)
+
+                            try:
+                                out = "REWARD_EVT|" + json.dumps(evt, ensure_ascii=False)
+                                self._broadcast_to_role("jefe", out)
+                                self._send_to_user_if_online(to_user, out)
+                                if action in ("award", "add", "create"):
+                                    title = evt.get("title") or "Premio"
+                                    self._send_to_user_if_online(to_user,
+                                                                 f"SHOW_POPUP|Premio|{actor} te envió: {title}")
+                            except:
+                                pass
+                            continue
+
+                        # ========== SCREENSHOT_DATA ==========
+                        if msg_item.startswith("SCREENSHOT_DATA|"):
+                            try:
+                                p = msg_item.split("|")
+                                if len(p) < 3:
+                                    continue
+                                fname = p[1]
+                                fsize = int(p[2])
+
+                                img = bytearray()
+                                if len(buf) > 0:
+                                    take = min(len(buf), fsize)
+                                    img.extend(buf[:take])
+                                    del buf[:take]
+
+                                if len(img) < fsize:
+                                    img.extend(self._recv_exact(conn, fsize - len(img), timeout=20.0))
+
+                                if len(img) >= fsize:
+                                    final_img = bytes(img[:fsize])
+                                    # ✅ IA: analizar TODAS las capturas que lleguen (independiente del throttle)
+                                    try:
+                                        with self.ai_queue_lock:
+                                            self.ai_queue.append({
+                                                "user": user,
+                                                "png": final_img,
+                                                "fname": fname,
+                                                "day": self._ai_day_str(),
+                                            })
+                                    except Exception as e:
+                                        self.log_to_console(f"No se pudo encolar IA: {e}", "ERR")
+
+                                    # ✅ decidir si guardo / reenvío
+                                    should_save, should_fwd = self._ss_tick_and_decide(user)
+
+                                    if should_save:
+                                        ensure_dir(self.capturas_dir)
+                                        file_path = os.path.join(self.capturas_dir, fname)
+                                        with open(file_path, "wb") as f:
+                                            f.write(final_img)
+                                        self.log_to_console(f"ARCHIVO GUARDADO: {fname} ({fsize} bytes)", "FILE")
+                                    else:
+                                        self.log_to_console(f"CAPTURA RECIBIDA (NO guardada por throttle): {fname}",
+                                                            "FILE")
+
+                                    if should_fwd:
+                                        threading.Thread(
+                                            target=self.forward_to_boss,
+                                            args=(final_img, fname, fsize),
+                                            daemon=True
+                                        ).start()
+
+
+                            except Exception as e:
+                                self.log_to_console(f"Error SCREENSHOT_DATA: {e}", "ERR")
+                            continue
+
+                        # ========== COMANDOS TEXTO ==========
+                        if msg_item.startswith("SEND_SCREENSHOT|"):
+                            parts = msg_item.split("|")
+                            target = parts[1].strip() if len(parts) >= 2 else ""
+                            tag = parts[2].strip() if len(parts) >= 3 and parts[2].strip() else "MANUAL"
+                            if target:
+                                target_conn = None
+                                with self.clients_lock:
+                                    for cw, info in self.clients.items():
+                                        if info.get("name") == target:
+                                            target_conn = cw
+                                            break
+                                if target_conn:
+                                    try:
+                                        target_conn.sendall(f"TAKE_SCREENSHOT|{tag}\n".encode("utf-8"))
+                                        self.log_to_console(f"Captura solicitada para: {target}", "CMD")
+                                    except:
+                                        pass
+                                else:
+                                    try:
+                                        connwrap.sendall(
+                                            f"CONSOLE_OUTPUT|Error: {target} no está online.\n".encode("utf-8"))
+                                    except:
+                                        pass
+                            continue
+
+                        if msg_item.startswith("SYNC_CHECK|"):
+                            try:
+                                missing_files = msg_item.split("|", 1)[1].split(",")
+                                for photo_name in missing_files:
+                                    photo_name = photo_name.strip()
+                                    if not photo_name:
+                                        continue
+                                    photo_path = os.path.join(self.capturas_dir, photo_name)
+                                    if os.path.exists(photo_path):
+                                        with open(photo_path, "rb") as f:
+                                            p_bytes = f.read()
+                                        header = f"PHOTO_DATA|{photo_name}|{len(p_bytes)}\n".encode("utf-8")
+                                        connwrap.sendall(header + p_bytes)
+                                        time.sleep(0.08)
+                            except Exception as e:
+                                self.log_to_console(f"Error SYNC_CHECK: {e}", "ERR")
+                            continue
+
+                        if msg_item.startswith("DOWNLOAD_PHOTO|"):
+                            try:
+                                photo_name = msg_item.split("|", 1)[1].strip()
+                                photo_path = os.path.join(self.capturas_dir, photo_name)
+                                if os.path.exists(photo_path):
+                                    with open(photo_path, "rb") as f:
+                                        p_bytes = f.read()
+                                    header = f"PHOTO_DATA|{photo_name}|{len(p_bytes)}\n".encode("utf-8")
+                                    connwrap.sendall(header + p_bytes)
+                            except:
+                                pass
+                            continue
+
+                        if msg_item.startswith("CMD_REMOTE|"):
+                            cmd_content = msg_item.split("|", 1)[1]
+                            import io
+                            from contextlib import redirect_stdout
+                            s = io.StringIO()
+                            try:
+                                with redirect_stdout(s):
+                                    self.process_command(cmd_content, executor=user)
+                                output = s.getvalue()
+                            except Exception as e:
+                                output = f"Error: {e}"
+                            try:
+                                connwrap.sendall(
+                                    f"CONSOLE_OUTPUT|{(output.strip() if output else 'OK.')}\n".encode("utf-8"))
+                            except:
+                                pass
+                            continue
+                        print(msg_item)
+                        if msg_item.startswith("REQUEST_USER_STATS|"):
+                            parts_req = msg_item.split("|")
+                            target = parts_req[1].strip() if len(parts_req) > 1 else ""
+                            raw_date = parts_req[2].strip() if len(parts_req) > 2 else ""
+
+                            # Limpieza absoluta de la fecha (solo los primeros 10 caracteres YYYY-MM-DD)
+                            req_day = raw_date[:10]
+
+                            # Validar formato con regex para evitar errores de lectura
+                            if not re.match(r"^\d{4}-\d{2}-\d{2}$", req_day):
+                                req_day = self._day_str_now()
+
+                            # Obtener estado de conexión
+                            with self.clients_lock:
+                                is_on = "ONLINE" if any(
+                                    i["name"] == target for i in self.clients.values()) else "OFFLINE"
+
+                            t_act, t_ina = self.get_persisted_times(target)
+
+                            # Leer actividad del día solicitado específicamente
+                            day_data = self._read_activity_day(target, req_day)
+                            if day_data:
+                                hist = self._format_activity_day_as_hist(day_data, top_n=10)
+                            else:
+                                hist = f"(sin datos para {req_day})"
+
+                            # Escapar saltos de línea para que no rompan el protocolo TCP
+                            hist_escaped = hist.replace("\n", "\\n")
+
+                            try:
+                                # Enviar respuesta con la fecha confirmada
+                                connwrap.sendall(
+                                    f"USER_STATS|{target}|{req_day}|{is_on}|{t_act}|{t_ina}|{hist_escaped}\n".encode(
+                                        "utf-8"))
+                            except Exception as e:
+                                self.log_to_console(f"Error enviando stats: {e}", "ERR")
+                            continue
+
+                        if msg_item == "REQUEST_USER_LIST":
+                            all_users = list(self.user_pass_cache.keys())
+                            try:
+                                connwrap.sendall(f"USER_LIST|{','.join(all_users)}\n".encode("utf-8"))
+                            except:
+                                pass
+                            continue
+
+                        if msg_item == "GET_SCREENSHOT_LIST":
+                            try:
+                                ensure_dir(self.capturas_dir)
+                                files = [f for f in os.listdir(self.capturas_dir)
+                                         if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+                                connwrap.sendall(f"SCREENSHOT_LIST|{','.join(files)}\n".encode("utf-8"))
+                            except Exception as e:
+                                self.log_to_console(f"Error GET_SCREENSHOT_LIST: {e}", "ERR")
+                            continue
+
+                        if msg_item.startswith("HISTORY|"):
+                            path = os.path.join(self.db_dir, f"{user}.txt")
+                            ensure_file(path)
+                            windows = msg_item.replace("HISTORY|", "").split(" | ")
+                            with self.file_lock:
+                                with open(path, "a", encoding="utf-8", errors="ignore") as f:
+                                    for w in windows:
+                                        w = w.strip()
+                                        if w:
+                                            f.write(w + "\n")
+                            continue
+
+                        if msg_item == "PING_WIFI":
+                            try:
+                                connwrap.sendall(b"PONG\n")
+                            except:
+                                pass
+                            continue
+
+                        if msg_item.startswith("WIFI_STATUS|"):
+                            parts = msg_item.split("|")
+                            if len(parts) >= 3:
+                                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                safe_append(
+                                    self.wifi_log_file,
+                                    f"[{ts}] {user} | WiFi: {parts[1]} | Ping: {parts[2]}\n",
+                                    self.file_lock
+                                )
+                                # ✅ guardar ping en state si parece número
+                                ping_str = parts[2].strip()
+                                ping_ms = None
+                                try:
+                                    # soporta "34ms" o "34"
+                                    ping_ms = int("".join([c for c in ping_str if c.isdigit()]) or "0")
+                                except:
+                                    ping_ms = None
+                                if ping_ms is not None:
+                                    self._ensure_state_users()
+                                    self.state["users"][user]["last_ping_ms"] = ping_ms
+                            continue
+
+                        self.log_to_console(f"Comando desconocido de {user}: {msg_item[:120]}", "DEBUG")
+
+                except socket.timeout:
+                    continue
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    break
+                except Exception as e:
+                    self.log_to_console(f"Error loop cliente {addr}: {e}", "ERR")
+                    break
+
+        except Exception as e:
+            self.log_to_console(f"Error con {addr}: {e}", "ERR")
+        finally:
+            if user_associated:
+                with self.clients_lock:
+                    if connwrap in self.clients:
+                        del self.clients[connwrap]
+                self.log_session(user_associated, "LOGOUT")
+                self.log_to_console(f"{user_associated} LOGOUT", "LOGOUT")
+            connwrap.close()
+    # =========================
+    # ✅ TAREAS + PREMIOS (SYNC)  (DENTRO DE LA CLASE)
+    # =========================
+    def _tasks_fp(self, user: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_\-]", "_", (user or "unknown"))
+        return os.path.join(self.tasks_dir, f"{safe}.json")
+
+    def _rewards_fp(self, user: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_\-]", "_", (user or "unknown"))
+        return os.path.join(self.rewards_dir, f"{safe}.json")
+
+    def _load_user_tasks(self, user: str):
+        fp = self._tasks_fp(user)
+        try:
+            if not os.path.exists(fp):
+                return []
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except:
+            return []
+
+    def _save_user_tasks(self, user: str, tasks_list):
+        fp = self._tasks_fp(user)
+        try:
+            ensure_dir(os.path.dirname(fp))
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump(tasks_list, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+
+    def _format_activity_day_as_hist(self, day_data: dict, top_n: int = 10) -> str:
+        if not day_data:
+            return "Sin datos (V2)"
+
+        def fmt(sec: float) -> str:
+            try:
+                sec = int(sec)
+            except:
+                sec = 0
+            m, s = divmod(sec, 60)
+            h, m = divmod(m, 60)
+            d, h = divmod(h, 24)
+            if d > 0:
+                return f"{d}d {h}h {m}m"
+            return f"{h}h {m}m"
+
+        fg_sorted = sorted(day_data.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
+        bg_sorted = sorted(day_data.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
+
+        out = "\n"
+        out += "TOP FOREGROUND (en foco)\n"
+        out += "-" * 28 + "\n"
+        for app, v in fg_sorted[:top_n]:
+            out += f" > {app[:35]:<35} [{fmt(v.get('fg', 0.0))}]\n"
+
+        out += "\nTOP BACKGROUND (abierta)\n"
+        out += "-" * 28 + "\n"
+        for app, v in bg_sorted[:top_n]:
+            out += f" > {app[:35]:<35} [{fmt(v.get('bg', 0.0))}]\n"
+
+        return out
+    def _load_user_rewards(self, user: str):
+        fp = self._rewards_fp(user)
+        try:
+            if not os.path.exists(fp):
+                return []
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except:
+            return []
+
+    def _save_user_rewards(self, user: str, rewards_list):
+        fp = self._rewards_fp(user)
+        try:
+            ensure_dir(os.path.dirname(fp))
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump(rewards_list, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+
+    def _broadcast_to_role(self, role: str, line: str):
+        role = (role or "").lower()
+        payload = (line.rstrip("\n") + "\n").encode("utf-8")
+        with self.clients_lock:
+            for cw, info in list(self.clients.items()):
+                try:
+                    if str(info.get("role", "")).lower() == role:
+                        cw.sendall(payload)
+                except:
+                    pass
+
+    def _send_to_user_if_online(self, username: str, line: str):
+        username = (username or "").strip()
+        if not username:
+            return
+        payload = (line.rstrip("\n") + "\n").encode("utf-8")
+        with self.clients_lock:
+            for cw, info in list(self.clients.items()):
+                try:
+                    if info.get("name") == username:
+                        cw.sendall(payload)
+                except:
+                    pass
+
+    # -------------------------
+    # FORWARD PHOTO TO BOSSES
+    # -------------------------
+    def forward_to_boss(self, img_data: bytes, fname: str, fsize: int):
+        try:
+            header = f"PHOTO_DATA|{fname}|{fsize}\n".encode("utf-8")
+            payload = header + img_data
+
+            with self.clients_lock:
+                bosses = [(cw, info) for cw, info in self.clients.items()
+                          if str(info.get("role", "")).lower() == "jefe"]
+
+            for cw, info in bosses:
+                try:
+                    cw.sendall(payload)
+                    self.log_to_console(f"Enviado PHOTO_DATA al Jefe: {info.get('name')}", "OK")
+                except:
+                    pass
+        except Exception as e:
+            self.log_to_console(f"Error forward_to_boss: {e}", "ERR")
+
+    # -------------------------
+    # ✅ UTILIDADES KPI / DISTRACTIONS (simple, no rompe nada)
+    # -------------------------
+    def _is_distracting_app(self, name: str) -> bool:
+        n = (name or "").lower()
+        keys = [
+            "youtube", "tiktok", "instagram", "facebook", "netflix", "prime video",
+            "disney", "twitch", "spotify", "steam", "epic", "discord", "x.com", "twitter",
+            "roblox", "minecraft", "valorant", "league of legends", "riot", "psn", "xbox",
+        ]
+        return any(k in n for k in keys)
+
+    def _estimate_kpi_from_activity(self, total_activity: dict) -> dict:
+        """
+        KPI estimado = productivo vs ocio basado en FG (en foco).
+        Devuelve {productive_sec, distracting_sec, kpi_pct}
+        """
+        productive = 0
+        distracting = 0
+        for app, v in (total_activity or {}).items():
+            try:
+                fg = int(float(v.get("fg", 0.0)))
+            except:
+                fg = 0
+            if self._is_distracting_app(app):
+                distracting += fg
+            else:
+                productive += fg
+
+        total = productive + distracting
+        kpi = int((productive / total) * 100) if total > 0 else 0
+        return {"productive_sec": productive, "distracting_sec": distracting, "kpi_pct": kpi}
+
+    def _format_seconds_hm(self, sec: int) -> str:
+        sec = int(sec) if sec else 0
+        m, s = divmod(sec, 60)
+        h, m = divmod(m, 60)
+        d, h = divmod(h, 24)
+        if d > 0:
+            return f"{d}d {h}h {m}m"
+        return f"{h}h {m}m"
+
+    # -------------------------
+    # ✅ PANEL hist_see <user>
+    # -------------------------
+    def hist_see_panel(self, user: str, days: int = 1, top_n: int = 8, timeline_n: int = 12) -> str:
+        self._ensure_state_users()
+
+        # online/offline
+        with self.clients_lock:
+            online_names = {info["name"] for info in self.clients.values()}
+        is_on = "ONLINE" if user in online_names else "OFFLINE"
+
+        role = self.user_role_cache.get(user, "empleado")
+
+        w_act, w_ina = self._get_times_from_state_weekly(user)
+        l_act, l_ina = self._get_times_from_state_lifetime(user)
+
+        # activity V2: hoy (days=1) por defecto
+        total = self._sum_activity_v2_days(user, days=days)
+        kpi = self._estimate_kpi_from_activity(total)
+
+        # top FG/BG
+        fg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
+        bg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
+
+        # timeline (si existe V1 legacy)
+        timeline = []
+        legacy_path = os.path.join(self.db_dir, f"{user}.txt")
+        if os.path.exists(legacy_path):
+            try:
+                with open(legacy_path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [l.strip() for l in f if l.strip()]
+                timeline = lines[-timeline_n:]
+            except:
+                timeline = []
+
+        # construir panel
+        out = []
+        out.append("=" * 86)
+        out.append(f"HIST_SEE PANEL  |  USER: {user}  |  ROL: {role}  |  ESTADO: {is_on}")
+        out.append("-" * 86)
+        out.append(f"TIEMPOS (WEEK)     Activo: {w_act:<12} | Inactivo: {w_ina:<12}")
+        out.append(f"TIEMPOS (LIFETIME) Activo: {l_act:<12} | Inactivo: {l_ina:<12}")
+        out.append("-" * 86)
+        out.append(f"KPI (estimado por FG)  Productivo: {self._format_seconds_hm(kpi['productive_sec'])} | "
+                   f"Ocio: {self._format_seconds_hm(kpi['distracting_sec'])} | "
+                   f"Eficiencia: {kpi['kpi_pct']}%")
+        out.append("-" * 86)
+
+        out.append("TOP FOREGROUND (FG)")
+        for app, v in fg_sorted[:top_n]:
+            out.append(f"  > {app[:45]:<45}  {self._format_seconds_hm(int(float(v.get('fg', 0.0))))}")
+
+        out.append("")
+        out.append("TOP BACKGROUND (BG)")
+        for app, v in bg_sorted[:top_n]:
+            out.append(f"  > {app[:45]:<45}  {self._format_seconds_hm(int(float(v.get('bg', 0.0))))}")
+
+        out.append("-" * 86)
+        if timeline:
+            out.append(f"TIMELINE (legacy V1) últimas {min(timeline_n, len(timeline))} entradas:")
+            for t in timeline:
+                out.append(f"  - {t[:80]}")
+        else:
+            out.append("TIMELINE: (sin legacy)  |  Nota: V2 guarda deltas por app, no eventos línea a línea.")
+        out.append("=" * 86)
+        return "\n".join(out)
+
+    # -------------------------
+    # PERSISTENCE LOOP
+    # -------------------------
+    def persistence_loop(self):
+        """
+        Importante: no bloquea loop principal.
+        - Actualiza tiempos cada 10s
+        - Crea JSON diario por usuario
+        - Guarda state cada ~30s
+        """
+        last_save = 0
+        while self.is_running:
+            time.sleep(10)
+            now = datetime.now()
+
+            # rotar si cambió semana mientras corre
+            self._rotate_if_week_changed()
+
+            all_users = list(self.user_pass_cache.keys())
+
+            # ✅ Asegura JSON diario por cada usuario existente
+            self.ensure_daily_activity_json_for_all_users()
+
+            with self.clients_lock:
+                online_names = [info["name"] for info in self.clients.values()]
+
+            for user in all_users:
+                if user in online_names:
+                    with self.last_lock:
+                        last = self.last_activity.get(user, now)
+                    category = "inactivo" if (now - last).total_seconds() > 12 else "activo"
+                    self.update_user_time_file(user, category)
+                else:
+                    self.update_user_time_file(user, "inactivo")
+
+            # push list to bosses (NO rompe protocolo)
+            u_list_str = ",".join(all_users)
+            with self.clients_lock:
+                for connwrap, info in list(self.clients.items()):
+                    if info.get("role") == "Jefe":
+                        try:
+                            connwrap.sendall(f"USER_LIST|{u_list_str}\n".encode("utf-8"))
+                        except:
+                            pass
+
+            # guardar state periódicamente (no cada loop, para no castigar disco)
+            if time.time() - last_save > 30:
+                self._save_state()
+                last_save = time.time()
+
+    # -------------------------
+    # CONSOLA SERVER
+    # -------------------------
+    def get_users_list(self):
+        return list(self.user_pass_cache.keys())
+
+    def _parse_wifi_last_pings(self, last_n: int = 30):
+        """
+        Devuelve (avg_ping_ms, count).
+        Parse simple de status_wifi.txt
+        """
+        if not os.path.exists(self.wifi_log_file):
+            return None, 0
+        try:
+            with open(self.wifi_log_file, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [l.strip() for l in f.readlines() if l.strip()]
+            lines = lines[-last_n:]
+            pings = []
+            for l in lines:
+                # "... | Ping: 34" o "... | Ping: 34ms"
+                if "Ping:" in l:
+                    tail = l.split("Ping:", 1)[1].strip()
+                    digits = "".join([c for c in tail if c.isdigit()])
+                    if digits:
+                        pings.append(int(digits))
+            if not pings:
+                return None, 0
+            return int(sum(pings) / len(pings)), len(pings)
+        except:
+            return None, 0
+
+    def _capturas_stats(self):
+        ensure_dir(self.capturas_dir)
+        total_bytes = 0
+        total_files = 0
+        try:
+            for f in os.listdir(self.capturas_dir):
+                p = os.path.join(self.capturas_dir, f)
+                if os.path.isfile(p):
+                    total_files += 1
+                    try:
+                        total_bytes += os.path.getsize(p)
+                    except:
+                        pass
+        except:
+            pass
+        return total_files, total_bytes
+
+    def process_command(self, cmd_raw, executor="CONSOLA"):
+        if executor == "CONSOLA":
+            self.save_command_log("CONSOLA", cmd_raw)
+        import shlex
+        try:
+            p = shlex.split(cmd_raw.strip())
+        except:
+            p = cmd_raw.strip().split(" ")
+
+        if not p:
+            return
+        c = p[0].lower()
+
+        # =========================================================
+        # ✅ A) COLOR / PRINTC
+        # =========================================================
+        if c == "color" and len(p) >= 2:
+            self.set_console_color(p[1])
+            print(f"Color default cambiado a {p[1]}")
+            return
+
+        if c == "printc" and len(p) >= 3:
+            n = p[1]
+            txt = " ".join(p[2:])
+            self.printc(n, txt)
+            return
+
+        if c == "help":
+            print("\n--- COMANDOS DE CONSOLA ---")
+            print("status                 - Ver salud y métricas del servidor (UPTIME/CPU/RAM/PING/etc)")
+            print("list                   - Estado detallado de usuarios")
+            print("reset_weekly           - Reseteo manual de tiempos y diario")
+            print("kick [user]            - Desconectar usuario")
+            print("add [user] [pass]      - Crear usuario (empleado)")
+            print("setrole [user] [R]     - Cambiar rol (jefe/empleado)")
+            print("msg [user] [texto]     - Enviar pop-up a un usuario")
+            print("history [user]         - Ver historial legacy (V1)")
+            print("hist_see [user]        - Panel completo (V2 + tiempos + KPI estimado)")
+            print("export_user [user]     - Export JSON + CSV del usuario")
+            print("export_all             - Export global")
+            print("diff_week [user]       - Comparar semana actual vs anterior")
+            print("color <0-9>            - Cambia color default consola")
+            print("printc <0-9> <texto>   - Imprime texto en ese color sin cambiar default")
+            print("roles                  - Ver lista de roles actual")
+            print("ex_list - Lista de excepciones (ocio) desde JSON")
+            print("ex_add <keyword> - Añade excepción (soporta comillas)")
+            print("ex_del <keyword> - Elimina excepción (soporta comillas)")
+            print("boss_ack - Ver jefes pendientes (0/1) de update de ocio")
+            print("ai_week [user] [days] - Resumen IA últimos N días + tendencia semanal")
+
+            print("historial              - Ver registro de comandos guardados")
+            print("reset_db               - Borrar usuarios")
+            print("reset_history          - Borrar actividad")
+            print("reset_roles            - Borrar roles")
+            print("reset_capturas         - Borrar todas las imágenes")
+            print("exit                   - Apagar servidor\n")
+            return
+        elif c == "ai_week" and len(p) >= 2:
+            user = p[1].strip()
+            days = 7
+            if len(p) >= 3:
+                try:
+                    days = int(p[2])
+                except:
+                    days = 7
+            print(self._ai_week_summary_text(user, days=days))
+            return
+
+        elif c == "reset_weekly":
+            print(self.perform_weekly_reset())
+            return
+        elif c == "ex_list":
+            cfg = self._load_distraction_config()
+            print("\n--- EXCEPCIONES (OCIO) ---")
+            print(f"Version: {cfg['version']} | Last change: {cfg['last_change']}")
+            for i, kw in enumerate(cfg["keywords"], 1):
+                print(f"{i:>3}. {kw}")
+            print("")
+            return
+
+        elif c == "ex_add" and len(p) >= 2:
+            kw = " ".join(p[1:])  # si vino sin comillas igual lo arma
+            kw_n = self._norm_kw(kw)
+            if not kw_n:
+                print("Error: keyword vacío.")
+                return
+
+            cfg = self._load_distraction_config()
+            kws = set(cfg["keywords"])
+            if kw_n in kws:
+                print(f"OK: ya existía '{kw_n}'. No se cambia nada.")
+                return
+
+            kws.add(kw_n)
+            self._write_distraction_keywords(sorted(kws))
+            # ✅ solo si cambió:
+            self._broadcast_restrictions_if_needed()
+            print(f"OK: añadido '{kw_n}' (se envió update a conectados).")
+            return
+
+        elif c == "ex_del" and len(p) >= 2:
+            kw = " ".join(p[1:])
+            kw_n = self._norm_kw(kw)
+            if not kw_n:
+                print("Error: keyword vacío.")
+                return
+
+            cfg = self._load_distraction_config()
+            kws = set(cfg["keywords"])
+            if kw_n not in kws:
+                print(f"OK: '{kw_n}' no estaba. No se cambia nada.")
+                return
+
+            kws.remove(kw_n)
+            self._write_distraction_keywords(sorted(kws))
+            # ✅ solo si cambió:
+            self._broadcast_restrictions_if_needed()
+            print(f"OK: eliminado '{kw_n}' (se envió update a conectados).")
+            return
+
+        elif c == "boss_ack":
+            ack = self._read_boss_ack()
+            print("\n--- BOSS ACK (ocio update) ---")
+            if not ack:
+                print("(vacío)")
+            else:
+                for b, v in ack.items():
+                    print(f"{b}: {v}")
+            print("")
+            return
+
+        # =========================================================
+        # ✅ D) STATUS mejorado (no rompe nada)
+        # =========================================================
+        elif c == "status":
+            uptime_sec = int(time.time() - self.start_ts)
+            up = self._format_seconds_hm(uptime_sec)
+
+            # psutil sin bloquear: interval=0
+            if psutil:
+                try:
+                    cpu = psutil.cpu_percent(interval=0)
+                except:
+                    cpu = 0
+                try:
+                    ram = psutil.virtual_memory().percent
+                except:
+                    ram = 0
+                try:
+                    net = psutil.net_io_counters()
+                except:
+                    net = None
+            else:
+                cpu = ram = 0
+                net = None
+
+            with self.clients_lock:
+                online = len(self.clients)
+                online_names = {info["name"] for info in self.clients.values()}
+            total_users = len(self.user_pass_cache)
+            offline = max(0, total_users - online)
+
+            avg_ping, ping_count = self._parse_wifi_last_pings(last_n=30)
+            cap_count, cap_bytes = self._capturas_stats()
+
+            last_save = self.state.get("meta", {}).get("last_save", None)
+            week_id = self.state.get("meta", {}).get("week_id", self._week_id_now())
+
+            print("\n--- STATUS SERVIDOR ---")
+            print(f"Uptime: {up}")
+            print(f"Week ID: {week_id}")
+            print(f"Usuarios: Total {total_users} | Online {online} | Offline {offline}")
+            print(f"Conexiones activas (sockets): {online}")
+            if avg_ping is not None:
+                print(f"Ping promedio (últimos {ping_count}): {avg_ping} ms")
+            else:
+                print("Ping promedio: (sin datos)")
+
+            print("\n--- HARDWARE ---")
+            print(f"CPU: {cpu}%")
+            print(f"RAM: {ram}%")
+            if net:
+                print(f"NET: TX {net.bytes_sent // 1024} KB | RX {net.bytes_recv // 1024} KB")
+
+            print("\n--- CAPTURAS/CACHE ---")
+            print(f"Capturas actuales: {cap_count} | Tamaño: {cap_bytes / (1024 * 1024):.2f} MB")
+            print(f"Último guardado persistencia: {last_save if last_save else '(pendiente)'}")
+
+            print("\n--- ÚLTIMOS REPORTES WIFI (últimos 10) ---")
+            if os.path.exists(self.wifi_log_file):
+                with open(self.wifi_log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                    for l in lines[-10:]:
+                        print(l.strip())
+            print("")
+            return
+
+        elif c == "msg" and len(p) >= 3:
+            target, mensaje = p[1], " ".join(p[2:])
+            sent = False
+            with self.clients_lock:
+                for cw, info in self.clients.items():
+                    if info.get("name") == target:
+                        try:
+                            cw.sendall(f"SHOW_POPUP|{mensaje}\n".encode("utf-8"))
+                            sent = True
+                        except:
+                            pass
+                        break
+            print(f"Pop-up {'enviado' if sent else 'NO enviado'} a {target}")
+            return
+
+        elif c == "list":
+            print("\n" + "=" * 85)
+            print(f"{'USUARIO':<15} | {'ESTADO':<10} | {'ACTIVO':<12} | {'INACTIVO':<12} | {'ROL':<10}")
+            print("-" * 85)
+            with self.clients_lock:
+                online_names = {info["name"] for info in self.clients.values()}
+            for u in self.user_pass_cache.keys():
+                is_on = "ONLINE" if u in online_names else "OFFLINE"
+                t_act, t_ina = self.get_persisted_times(u)
+                rol = self.user_role_cache.get(u, "empleado")
+                print(f"{u:<15} | {is_on:<10} | {t_act:<12} | {t_ina:<12} | {rol:<10}")
+            print("=" * 85 + "\n")
+            return
+
+        elif c == "roles":
+            print("\n--- ROLES EN RAM ---")
+            for u, r in self.user_role_cache.items():
+                print(f"{u}: {r}")
+            return
+
+        elif c == "historial":
+            if os.path.exists(self.command_log_file):
+                with open(self.command_log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    print(f.read())
+            return
+
+        elif c == "reset_capturas":
+            try:
+                shutil.rmtree(self.capturas_dir, ignore_errors=True)
+                ensure_dir(self.capturas_dir)
+                self.log_to_console("Capturas eliminadas.", "RESET")
+            except Exception as e:
+                self.log_to_console(f"Error reset_capturas: {e}", "ERR")
+            return
+
+        elif c == "kick" and len(p) > 1:
+            target = p[1].lower()
+            kicked = False
+            with self.clients_lock:
+                for cw, info in list(self.clients.items()):
+                    if info.get("name", "").lower() == target:
+                        try:
+                            cw.close()
+                        except:
+                            pass
+                        del self.clients[cw]
+                        kicked = True
+                        break
+            print(f"Usuario {p[1]} {'expulsado' if kicked else 'no encontrado'}.")
+            return
+
+        elif c == "add" and len(p) == 3:
+            user, pw = p[1], p[2]
+            with self.file_lock:
+                safe_append(self.pass_file, f"{user}:{pw}\n", self.file_lock)
+                safe_append(self.role_file, f"{user}:empleado\n", self.file_lock)
+            self.user_pass_cache[user] = pw
+            self.user_role_cache[user] = "empleado"
+
+            # nuevo: estado persistente
+            self._ensure_state_users()
+            self._save_state()
+
+            print(f"Usuario {user} añadido.")
+            return
+
+        elif c == "setrole" and len(p) == 3:
+            user, role = p[1], p[2]
+            with self.file_lock:
+                ensure_file(self.role_file)
+                lines = []
+                with open(self.role_file, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                found = False
+                with open(self.role_file, "w", encoding="utf-8") as f:
+                    for line in lines:
+                        if line.startswith(f"{user}:"):
+                            f.write(f"{user}:{role}\n")
+                            found = True
+                        else:
+                            f.write(line)
+                    if not found:
+                        f.write(f"{user}:{role}\n")
+            self.user_role_cache[user] = role
+            print(f"Rol de {user} actualizado a {role}.")
+            return
+
+        elif c == "history" and len(p) > 1:
+            print(self.analyze_history(p[1]))
+            return
+
+        # =========================================================
+        # ✅ B) hist_see <user>
+        # =========================================================
+        elif c == "hist_see" and len(p) > 1:
+            user = p[1].strip()
+            print(self.hist_see_panel(user, days=1, top_n=8, timeline_n=12))
+            return
+
+        # =========================================================
+        # ✅ E) export_user / export_all / diff_week
+        # =========================================================
+        elif c == "export_user" and len(p) > 1:
+            user = p[1].strip()
+            out = self._export_user(user)
+            print(out)
+            return
+
+        elif c == "export_all":
+            out = self._export_all()
+            print(out)
+            return
+
+        elif c == "diff_week" and len(p) > 1:
+            user = p[1].strip()
+            out = self._diff_week(user)
+            print(out)
+            return
+
+        elif c == "reset_db":
+            with self.file_lock:
+                ensure_file(self.pass_file)
+                with open(self.pass_file, "w", encoding="utf-8") as f:
+                    f.write("")
+            self.user_pass_cache.clear()
+            print("Base de datos de usuarios limpiada.")
+            return
+
+        elif c == "reset_history":
+            ensure_dir(self.db_dir)
+            for f in os.listdir(self.db_dir):
+                if f.endswith(".txt") and f not in ["sesiones.txt", "registro_comandos.txt", "status_wifi.txt"]:
+                    try:
+                        os.remove(os.path.join(self.db_dir, f))
+                    except:
+                        pass
+            print("Historial de aplicaciones borrado.")
+
+            try:
+                shutil.rmtree(self.activity_dir, ignore_errors=True)
+                ensure_dir(self.activity_dir)
+            except:
+                pass
+            return
+
+        elif c == "reset_roles":
+            with self.file_lock:
+                ensure_file(self.role_file)
+                with open(self.role_file, "w", encoding="utf-8") as f:
+                    f.write("")
+            self.user_role_cache.clear()
+            print("Roles borrados.")
+            return
+
+        elif c == "exit":
+            self.is_running = False
+            self._save_state()
+            os._exit(0)
+
+        # si llega acá, no era comando conocido (consola)
+        # (no rompo tu flujo)
+        # print("Comando no reconocido. Escribí 'help'.")
+
+    # -------------------------
+    # ✅ EXPORTS / DIFF
+    # -------------------------
+    def _export_user(self, user: str) -> str:
+        self._ensure_state_users()
+        if user not in self.state.get("users", {}):
+            return f"Error: usuario {user} no existe en state."
+
+        # data
+        ud = self.state["users"][user]
+        role = self.user_role_cache.get(user, "empleado")
+
+        w_act, w_ina = self._get_times_from_state_weekly(user)
+        l_act, l_ina = self._get_times_from_state_lifetime(user)
+
+        total_today = self._sum_activity_v2_days(user, days=1)
+        kpi_today = self._estimate_kpi_from_activity(total_today)
+
+        fg_sorted = sorted(total_today.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
+        bg_sorted = sorted(total_today.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
+
+        export_obj = {
+            "export_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "user": user,
+            "role": role,
+            "week_id": self.state.get("meta", {}).get("week_id", self._week_id_now()),
+            "times": {
+                "weekly_active": w_act,
+                "weekly_inactive": w_ina,
+                "lifetime_active": l_act,
+                "lifetime_inactive": l_ina,
+            },
+            "kpi_today_est": kpi_today,
+            "top_fg_today": [{"app": a, "sec": int(float(v.get("fg", 0.0)))} for a, v in fg_sorted[:20]],
+            "top_bg_today": [{"app": a, "sec": int(float(v.get("bg", 0.0)))} for a, v in bg_sorted[:20]],
+            "raw_activity_today": total_today,
+            "prev_week": ud.get("prev_week")
+        }
+
+        # guardar JSON
+        ensure_dir(self.exports_dir)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = os.path.join(self.exports_dir, f"export_user_{user}_{stamp}.json")
+        csv_path = os.path.join(self.exports_dir, f"export_user_{user}_{stamp}.csv")
+
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(export_obj, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return f"Error export JSON: {e}"
+
+        # CSV: top fg/bg
+        try:
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["user", user])
+                w.writerow(["role", role])
+                w.writerow(["export_ts", export_obj["export_ts"]])
+                w.writerow([])
+                w.writerow(["TOP_FG_TODAY"])
+                w.writerow(["app", "seconds"])
+                for row in export_obj["top_fg_today"]:
+                    w.writerow([row["app"], row["sec"]])
+                w.writerow([])
+                w.writerow(["TOP_BG_TODAY"])
+                w.writerow(["app", "seconds"])
+                for row in export_obj["top_bg_today"]:
+                    w.writerow([row["app"], row["sec"]])
+        except Exception as e:
+            return f"JSON OK ({json_path}) pero CSV error: {e}"
+
+        return f"Export OK:\n - JSON: {json_path}\n - CSV:  {csv_path}"
+
+    def _export_all(self) -> str:
+        self._ensure_state_users()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(self.exports_dir, f"export_all_{stamp}.json")
+
+        with self.clients_lock:
+            online_names = {info["name"] for info in self.clients.values()}
+
+        all_obj = {
+            "export_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "week_id": self.state.get("meta", {}).get("week_id", self._week_id_now()),
+            "total_users": len(self.user_pass_cache),
+            "online_now": sorted(list(online_names)),
+            "users": {}
+        }
+
+        for user in self.user_pass_cache.keys():
+            role = self.user_role_cache.get(user, "empleado")
+            is_on = (user in online_names)
+            w_act, w_ina = self._get_times_from_state_weekly(user)
+            l_act, l_ina = self._get_times_from_state_lifetime(user)
+
+            total_today = self._sum_activity_v2_days(user, days=1)
+            kpi_today = self._estimate_kpi_from_activity(total_today)
+
+            all_obj["users"][user] = {
+                "role": role,
+                "status": "ONLINE" if is_on else "OFFLINE",
+                "weekly_active": w_act,
+                "weekly_inactive": w_ina,
+                "lifetime_active": l_act,
+                "lifetime_inactive": l_ina,
+                "kpi_today_est": kpi_today,
+                "prev_week": self.state["users"].get(user, {}).get("prev_week"),
+            }
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(all_obj, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return f"Error export_all: {e}"
+
+        return f"Export global OK: {out_path}"
+
+    def _diff_week(self, user: str) -> str:
+        self._ensure_state_users()
+        ud = self.state.get("users", {}).get(user)
+        if not ud:
+            return f"Error: usuario {user} no existe."
+
+        prev = ud.get("prev_week")
+        if not prev:
+            return f"No hay semana anterior guardada todavía para {user} (prev_week vacío)."
+
+        cur_act = int(ud.get("weekly_active", 0))
+        cur_ina = int(ud.get("weekly_inactive", 0))
+
+        prev_act = int(prev.get("weekly_active", 0))
+        prev_ina = int(prev.get("weekly_inactive", 0))
+
+        # KPI de hoy como indicador (no histórico real)
+        total_today = self._sum_activity_v2_days(user, days=1)
+        kpi_today = self._estimate_kpi_from_activity(total_today)
+
+        # top distracciones hoy
+        distract = []
+        for app, v in total_today.items():
+            if self._is_distracting_app(app):
+                distract.append((app, int(float(v.get("fg", 0.0)))))
+        distract.sort(key=lambda x: x[1], reverse=True)
+        distract = distract[:8]
+
+        def delta(a, b):
+            return a - b
+
+        out = []
+        out.append("=" * 86)
+        out.append(f"DIFF_WEEK | USER: {user}")
+        out.append(f"Semana actual: {self.state.get('meta', {}).get('week_id', self._week_id_now())}")
+        out.append(f"Semana anterior: {prev.get('week_id')}")
+        out.append("-" * 86)
+        out.append(
+            f"ACTIVE  (cur): {self._format_seconds_hm(cur_act)}   | (prev): {self._format_seconds_hm(prev_act)}   | Δ {self._format_seconds_hm(delta(cur_act, prev_act))}")
+        out.append(
+            f"INACTIV (cur): {self._format_seconds_hm(cur_ina)}   | (prev): {self._format_seconds_hm(prev_ina)}   | Δ {self._format_seconds_hm(delta(cur_ina, prev_ina))}")
+        out.append("-" * 86)
+        out.append(
+            f"KPI hoy (estimado): {kpi_today['kpi_pct']}% | Productivo {self._format_seconds_hm(kpi_today['productive_sec'])} | Ocio {self._format_seconds_hm(kpi_today['distracting_sec'])}")
+        out.append("-" * 86)
+        if distract:
+            out.append("Top distracciones HOY (FG):")
+            for a, s in distract:
+                out.append(f"  > {a[:45]:<45} {self._format_seconds_hm(s)}")
+        else:
+            out.append("Top distracciones HOY: (sin datos o sin apps detectadas)")
+        out.append("=" * 86)
+        return "\n".join(out)
+
+    # -------------------------
+    # ACCEPT LOOP
+    # -------------------------
+    def accept_loop(self):
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server_sock.bind((self.host, self.port))
+            server_sock.listen(200)
+            self.log_to_console(f"SERVIDOR TCP ACTIVO EN {self.host}:{self.port}", "SYS")
+            while self.is_running:
+                c, addr = server_sock.accept()
+                threading.Thread(target=self.handle_client, args=(c, addr), daemon=True).start()
+        except Exception as e:
+            self.log_to_console(f"Error crítico accept_loop: {e}", "ERR")
+        finally:
+            try:
+                server_sock.close()
+            except:
+                pass
+
+    def _ai_analyze_task(self, user: str, task_obj: dict) -> dict:
+        """
+        Analiza un task (ej: Google Calendar) usando IA + contexto del server.
+        Devuelve dict JSON (no texto).
+        """
+        if not self.ai_client:
+            return {
+                "type": "ai_task_analysis",
+                "user": user,
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "error": "OpenAI no disponible (faltan dependencias o OPENAI_API_KEY)."
+            }
+
+        ctx = self._ai_build_server_context(user)
+
+        # Recorte defensivo para no mandar un monstruo (pero manteniendo raw)
+        # Si querés mandar TODO sí o sí, eliminá este bloque.
+        safe_task = dict(task_obj or {})
+        try:
+            raw = safe_task.get("raw")
+            if isinstance(raw, dict):
+                # evita tokens absurdos si el raw trae muchísimo
+                safe_task["raw"] = raw  # dejalo entero si querés; está OK
+        except:
+            pass
+
+        prompt = (
+            "Sos un analista senior de productividad y planificación. "
+            "Te llega un TASK (p.ej. de Google Calendar) y el CONTEXTO del usuario (actividad, KPI, top apps, semana, etc.).\n\n"
+            "Objetivo:\n"
+            "- Entender y resumir el task.\n"
+            "- Explicar qué significa / qué pide / qué impacto puede tener.\n"
+            "- Detectar riesgos (solapes, urgencia, señales de saturación, incoherencias).\n"
+            "- Sugerir próximos pasos concretos.\n\n"
+            "IMPORTANTE:\n"
+            "- Devolvé SOLO JSON válido.\n"
+            "- No inventes datos (fechas/horas) que no estén.\n"
+            "- Si falta info, indicá qué falta.\n\n"
+            "JSON schema:\n"
+            "{"
+            "\"task_type\": string, "
+            "\"task_title\": string, "
+            "\"task_summary\": string, "
+            "\"key_fields\": {\"date\": string, \"time\": string, \"location\": string, \"people\": string, \"notes\": string}, "
+            "\"meaning\": string, "
+            "\"risk_flags\": [string], "
+            "\"missing_info\": [string], "
+            "\"next_steps\": [string, string, string], "
+            "\"rolling_summary\": string, "
+            "\"confidence\": \"low|medium|high\""
+            "}\n\n"
+            "CONTEXTO_DEL_SERVER:\n"
+            f"{json.dumps(ctx, ensure_ascii=False)}\n\n"
+            "TASK_JSON:\n"
+            f"{json.dumps(safe_task, ensure_ascii=False)}\n"
+        )
+
+        try:
+            resp = self.ai_client.responses.create(
+                model=self.ai_model,
+                input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            )
+            txt = (resp.output_text or "").strip()
+            obj = json.loads(txt)
+            if not isinstance(obj, dict):
+                raise ValueError("no dict")
+
+        except Exception:
+            # fallback
+            obj = {
+                "task_type": (safe_task.get("source") or "task"),
+                "task_title": (safe_task.get("title") or ""),
+                "task_summary": "",
+                "key_fields": {"date": safe_task.get("date", ""), "time": "", "location": "", "people": "",
+                               "notes": ""},
+                "meaning": "",
+                "risk_flags": ["json_parse_failed_or_model_error"],
+                "missing_info": [],
+                "next_steps": [],
+                "rolling_summary": "",
+                "confidence": "low",
+            }
+
+        obj["_meta"] = {
+            "type": "ai_task_analysis",
+            "user": user,
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "hour": datetime.now().hour,
+            "weekday": datetime.now().weekday(),
+        }
+        return obj
+
+    def _attach_ai_analysis_to_task(self, assignee: str, task_id: str, analysis: dict) -> bool:
+        """
+        Mete el resultado de IA dentro del task en basededatos/tasks/<assignee>.json
+        Devuelve True si lo encontró y actualizó.
+        """
+        if not assignee or not task_id or not isinstance(analysis, dict):
+            return False
+
+        updated = False
+        with self.tasks_lock:
+            tasks_list = self._load_user_tasks(assignee)
+            for i, t in enumerate(tasks_list):
+                if isinstance(t, dict) and t.get("id") == task_id:
+                    t["ai_analysis"] = analysis
+                    t["ai_analyzed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    # campos útiles quick-access
+                    t["ai_flags"] = analysis.get("risk_flags", [])
+                    t["ai_confidence"] = analysis.get("confidence", "")
+                    tasks_list[i] = t
+                    updated = True
+                    break
+
+            if updated:
+                self._save_user_tasks(assignee, tasks_list)
+
+        return updated
+
+    def run(self):
+        threading.Thread(target=self.accept_loop, daemon=True).start()
+        # set default color to current setting
+        self.set_console_color(self.console_default_color)
+        print("--- SERVIDOR DE KONTROL OPTIMIZADO INICIADO ---")
+        while self.is_running:
+            try:
+                cmd = input("KONTROL> ")
+                if cmd:
+                    self.process_command(cmd)
+            except EOFError:
+                break
+
+
+# =========================
+# ✅ TAREAS + PREMIOS (SYNC)
+# =========================
+def _tasks_fp(self, user: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", (user or "unknown"))
+    return os.path.join(self.tasks_dir, f"{safe}.json")
+
+
+def _rewards_fp(self, user: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", (user or "unknown"))
+    return os.path.join(self.rewards_dir, f"{safe}.json")
+
+
+def _load_user_tasks(self, user: str):
+    fp = self._tasks_fp(user)
+    try:
+        if not os.path.exists(fp):
+            return []
+        with open(fp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except:
+        return []
+
+
+def _save_user_tasks(self, user: str, tasks_list):
+    fp = self._tasks_fp(user)
+    try:
+        ensure_dir(os.path.dirname(fp))
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump(tasks_list, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
+
+def _load_user_rewards(self, user: str):
+    fp = self._rewards_fp(user)
+    try:
+        if not os.path.exists(fp):
+            return []
+        with open(fp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except:
+        return []
+
+
+def _save_user_rewards(self, user: str, rewards_list):
+    fp = self._rewards_fp(user)
+    try:
+        ensure_dir(os.path.dirname(fp))
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump(rewards_list, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
+
+def _broadcast_to_role(self, role: str, line: str):
+    role = (role or "").lower()
+    payload = (line.rstrip("\n") + "\n").encode("utf-8")
+    with self.clients_lock:
+        for cw, info in list(self.clients.items()):
+            try:
+                if str(info.get("role", "")).lower() == role:
+                    cw.sendall(payload)
+            except:
+                pass
+
+
+def _send_to_user_if_online(self, username: str, line: str):
+    username = (username or "").strip()
+    if not username:
+        return
+    payload = (line.rstrip("\n") + "\n").encode("utf-8")
+    with self.clients_lock:
+        for cw, info in list(self.clients.items()):
+            try:
+                if info.get("name") == username:
+                    cw.sendall(payload)
+            except:
+                pass
+
+
+
+if __name__ == "__main__":
+    server = TerminalServer(DEFAULT_HOST, DEFAULT_PORT)
+    server.run()
