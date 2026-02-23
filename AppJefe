@@ -1278,7 +1278,7 @@ class PerfomanceView(ctk.CTkFrame):
         self.all_users_stats = all_users_stats or []
         self.on_refresh = on_refresh
         self.on_change_user = on_change_user
-        self.selected_day = date.today().strftime("%Y-%m-%d")
+        self.selected_day = date.today()
 
         self.user_list = user_list or []
         self.selected_apps_to_compare = {}
@@ -1706,7 +1706,18 @@ class PerfomanceView(ctk.CTkFrame):
             return
         self._set_selected_day(d)
 
+    def _dispose_figures(self):
+        for name in ("pie_fig", "bar_fig", "kpi_fig", "custom_fig", "adv_fig"):
+            fig = getattr(self, name, None)
+            if fig is not None:
+                try:
+                    plt.close(fig)
+                except Exception:
+                    pass
+                setattr(self, name, None)
+
     def _render_all_tabs(self):
+        self._dispose_figures()
         self._safe_setup("Actividad vs Inactividad", self.setup_pie_chart)
         self._safe_setup("Top 3 (FOCO)", self.setup_bar_chart)
         self._safe_setup("Comparador", self.setup_custom_chart)
@@ -3714,6 +3725,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         for s in ax.spines.values():
             s.set_color('#444')
         ax.set_ylabel("Horas", color="white")
+        ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=15, ha="right", color="white")
 
         canvas = FigureCanvasTkAgg(fig, master=tab)
@@ -4890,7 +4902,11 @@ class KClientApp(ctk.CTk):
         self._stats_block_fg_time = None
         self._stats_block_bg_time = None
         self._stats_block_lines = []
+        self._stats_block_date = ""
+        self._stats_flush_after_id = None
 
+        # generación para cancelar barridos viejos de stats all-users
+        self._all_stats_req_gen = 0
 
         # ✅ Si el servidor envía las líneas de stats ANTES del header USER_STATS (orden invertido), las guardamos aquí
         self._pre_stats_lines = []
@@ -5280,6 +5296,10 @@ class KClientApp(ctk.CTk):
         self._auto_stats_thread.start()
 
     def _flush_user_stats_block(self):
+        try:
+            self._stats_flush_after_id = None
+        except Exception:
+            pass
         if not self._stats_block_active:
             return
         self._stats_block_active = False
@@ -6401,6 +6421,7 @@ class KClientApp(ctk.CTk):
         """
         Pide stats de todos los usuarios conocidos (cacheados).
         Usa after() para no spamear el socket de golpe.
+        Cancela barridos anteriores para no mezclar respuestas entre días.
         """
         if day is None:
             day = date.today().isoformat()
@@ -6415,9 +6436,13 @@ class KClientApp(ctk.CTk):
         for u in users:
             self._latest_stats.setdefault(u, {"fg_time": "0", "bg_time": "0", "status": "", "raw": ""})
 
+        self._all_stats_req_gen += 1
+        my_gen = self._all_stats_req_gen
+
         def _tick(i=0):
+            if my_gen != self._all_stats_req_gen:
+                return
             if i >= len(users):
-                # al terminar, empuja un refresh del perf_view si está abierto
                 try:
                     if hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists():
                         all_stats = self._build_all_users_stats()
@@ -6431,7 +6456,7 @@ class KClientApp(ctk.CTk):
 
             u = users[i]
             try:
-                self._request_user_stats(u, day)  # REQUEST_USER_STATS|u|YYYY-MM-DD
+                self._request_user_stats(u, day)
             except Exception as e:
                 print("request_all_users_stats _request_user_stats error:", u, e)
 
@@ -7547,17 +7572,16 @@ class KClientApp(ctk.CTk):
                 bg_time = parts[5].strip()
                 history_raw = parts[6].replace("\\n", "\n") if len(parts) > 6 else ""
 
-                # Cache directo (el server envía una sola línea)
-                if not hasattr(self, "_latest_stats") or self._latest_stats is None:
-                    self._latest_stats = {}
-                self._latest_stats.setdefault(user, {})
-                self._latest_stats[user]["fg_time"] = fg_time
-                self._latest_stats[user]["bg_time"] = bg_time
-                self._latest_stats[user]["status"] = status
-                self._latest_stats[user]["raw"] = history_raw
-                self._append_user_history(user, history_raw)
+                # preparar bloque (soporta payload en 1 línea o multiline en líneas siguientes)
+                self._stats_block_active = True
+                self._stats_block_user = user
+                self._stats_block_status = status
+                self._stats_block_fg_time = fg_time
+                self._stats_block_bg_time = bg_time
+                self._stats_block_date = req_date
+                self._stats_block_lines = [history_raw] if history_raw else []
 
-                # UI: cards + detalle seleccionado
+                # UI rápida de estado (card + detalle)
                 if hasattr(self, "employees_panel") and self.employees_panel and self.employees_panel.winfo_exists():
                     color = OK if status == "ONLINE" else DANGER
                     self.employees_panel.set_user_status(user, status, color=color)
@@ -7567,22 +7591,14 @@ class KClientApp(ctk.CTk):
                         self.lbl_detail.configure(text=f"Empleado: {user} | Fecha: {req_date}\nEstado: {status}")
                     except Exception:
                         pass
-                    self._ui_set_history_text(history_raw)
 
-                # Performance abierta para ese usuario
+                # flush diferido: captura multiline, pero también cierra casos de una sola línea
                 try:
-                    if (hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists()
-                            and getattr(self.perf_view, "target_user", None) == user):
-                        self.perf_view.update_data(
-                            active_time_str=fg_time,
-                            inactive_time_str=bg_time,
-                            history_raw=history_raw,
-                        )
-                        if req_date:
-                            d_obj = datetime.strptime(req_date, "%Y-%m-%d").date()
-                            self.after(0, lambda d=d_obj: self.perf_view._set_selected_day(d, notify_server=False))
+                    if getattr(self, "_stats_flush_after_id", None):
+                        self.after_cancel(self._stats_flush_after_id)
                 except Exception:
                     pass
+                self._stats_flush_after_id = self.after(120, self._flush_user_stats_block)
 
             return
 
