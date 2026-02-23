@@ -4864,7 +4864,8 @@ class KClientApp(ctk.CTk):
         # =========================
         self._auto_stats_thread = None
         self._auto_stats_stop = threading.Event()
-        self._stats_req_last: Dict[str, float] = {}  # user -> last request time
+        self._stats_req_last: Dict[str, float] = {}  # user|day -> last request time
+        self._stats_request_day_cache = date.today().isoformat()
         # =========================
         # Auto-capturas por hora (random dentro de la hora)
         # =========================
@@ -5243,6 +5244,16 @@ class KClientApp(ctk.CTk):
         )
         return line.startswith(prefixes)
 
+    def _get_selected_day_for_requests(self):
+        """Devuelve día YYYY-MM-DD sin tocar objetos Tk desde hilos secundarios."""
+        try:
+            day = (getattr(self, "_stats_request_day_cache", "") or "").strip()
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+                return day
+        except Exception:
+            pass
+        return date.today().isoformat()
+
     def _request_user_stats_throttled(self, user: str, day: str = None):
         user = (user or "").strip()
         if not user:
@@ -5252,6 +5263,10 @@ class KClientApp(ctk.CTk):
 
         if not day:
             day = date.today().isoformat()
+        try:
+            self._stats_request_day_cache = day
+        except Exception:
+            pass
         key = f"{user}|{day}"
 
         now = time.time()
@@ -6419,6 +6434,10 @@ class KClientApp(ctk.CTk):
         if not day:
             day = date.today().isoformat()
         try:
+            self._stats_request_day_cache = day
+        except Exception:
+            pass
+        try:
             with self.socket_lock:
                 self.sock.sendall(f"REQUEST_USER_STATS|{user}|{day}\n".encode("utf-8"))
                 print(">>> SEND REQUEST_USER_STATS:", f"REQUEST_USER_STATS|{user}|{day}")
@@ -6433,6 +6452,10 @@ class KClientApp(ctk.CTk):
         """
         if day is None:
             day = date.today().isoformat()
+        try:
+            self._stats_request_day_cache = day
+        except Exception:
+            pass
         users = list(getattr(self, "_cached_users", []) or [])
         if not users:
             print("request_all_users_stats: no hay _cached_users")
