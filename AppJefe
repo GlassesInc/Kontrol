@@ -1734,6 +1734,28 @@ class PerfomanceView(ctk.CTkFrame):
         self._safe_setup("Estadistica avanzada", self.setup_advanced_stats_tab)
 
 
+    def _selected_day_iso(self) -> str:
+        try:
+            d = getattr(self, "selected_day", None)
+            if hasattr(d, "isoformat"):
+                return d.isoformat()
+        except Exception:
+            pass
+        try:
+            return date.today().isoformat()
+        except Exception:
+            return ""
+
+    def _safe_after_ui(self, fn):
+        try:
+            if not self.winfo_exists():
+                return False
+            self.after(0, fn)
+            return True
+        except Exception:
+            return False
+
+
     def setup_ai_tools_tab(self):
         tab = self.tabview.tab("Herramientas IA")
         for w in tab.winfo_children():
@@ -1779,13 +1801,14 @@ class PerfomanceView(ctk.CTkFrame):
         right = ctk.CTkFrame(header, fg_color="transparent")
         right.pack(side="right", padx=12, pady=12)
 
-        # Controles (fecha + líneas)
-        self.ai_date_entry = ctk.CTkEntry(right, width=140, placeholder_text="YYYY-MM-DD")
-        self.ai_date_entry.grid(row=0, column=0, padx=(0, 8), pady=(0, 6))
-        try:
-            self.ai_date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
-        except:
-            pass
+        # Controles (usa fecha global seleccionada + líneas)
+        self.ai_day_lbl = ctk.CTkLabel(
+            right,
+            text=f"Fecha: {self._selected_day_iso()}",
+            font=("Roboto", 12),
+            text_color=MUT,
+        )
+        self.ai_day_lbl.grid(row=0, column=0, padx=(0, 8), pady=(0, 6), sticky="e")
 
         self.ai_lines_entry = ctk.CTkEntry(right, width=90, placeholder_text="300")
         self.ai_lines_entry.grid(row=0, column=1, padx=(0, 8), pady=(0, 6))
@@ -1837,7 +1860,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         def _req_log():
             u = (self.user_var.get() or self.target_user or "").strip()
-            day = (self.ai_date_entry.get() or "").strip()
+            day = self._selected_day_iso()
             max_lines = _safe_int(self.ai_lines_entry.get(), 300)
 
             if not u:
@@ -1869,7 +1892,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         def _req_summary():
             u = (self.user_var.get() or self.target_user or "").strip()
-            day = (self.ai_date_entry.get() or "").strip()
+            day = self._selected_day_iso()
             if not u:
                 return
             if not day:
@@ -2675,10 +2698,7 @@ class PerfomanceView(ctk.CTkFrame):
             # redibujo opcional (no obligatorio, pero mantiene todo coherente)
             self._adv_redraw_all_lines()
 
-        try:
-            self.after(0, ui)
-        except:
-            ui()
+        self._safe_after_ui(ui)
 
     def _adv_refresh_users_box(self):
         try:
@@ -3133,7 +3153,7 @@ class PerfomanceView(ctk.CTkFrame):
         user = (self.user_var.get() or self.target_user or "").strip()
         day = ""
         try:
-            day = (self.ai_date_entry.get() or "").strip()
+            day = self._selected_day_iso()
         except:
             pass
 
@@ -3212,10 +3232,7 @@ class PerfomanceView(ctk.CTkFrame):
             self._ai_chat_history.append(("assistant", out_text or "Sin respuesta."))
             self._render_ai_chat_history()
 
-        try:
-            self.after(0, ui)
-        except:
-            ui()
+        self._safe_after_ui(ui)
 
     def _build_ai_context(self, user: str, day: str) -> str:
         # contexto principal: log IA recibido (si existe)
@@ -3358,10 +3375,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             self._ai_chat_history.append(("assistant", out_text))
             self._render_ai_chat_history()
 
-        try:
-            self.after(0, ui)
-        except:
-            ui()
+        self._safe_after_ui(ui)
 
     def set_ai_log_text(self, user: str, day: str, text: str):
         self._ai_log_meta = f"{user} — {day}"
@@ -3380,10 +3394,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             except:
                 pass
 
-        try:
-            self.after(0, ui)
-        except:
-            ui()
+        self._safe_after_ui(ui)
 
     def _on_pick_user(self, user):
         if not user or user == self.target_user:
@@ -3969,13 +3980,6 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         canvas = FigureCanvasTkAgg(fig, master=tab)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
-        chart_holder = ctk.CTkFrame(self, width=900, height=320)
-        chart_holder.pack(fill="x", padx=10, pady=10)  # NO expand
-        chart_holder.pack_propagate(False)  # ✅ evita que se achique
-
-        canvas = FigureCanvasTkAgg(fig, master=chart_holder)
-        w = canvas.get_tk_widget()
-        w.pack(fill="both", expand=True)  # expand SOLO dentro del holder fijo
 
         # guardar refs para evitar GC
         self.pie_fig = fig
@@ -4019,13 +4023,6 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
 
         self.bar_fig = fig
         self.bar_canvas = canvas
-        chart_holder = ctk.CTkFrame(self, width=900, height=320)
-        chart_holder.pack(fill="x", padx=10, pady=10)  # NO expand
-        chart_holder.pack_propagate(False)  # ✅ evita que se achique
-
-        canvas = FigureCanvasTkAgg(fig, master=chart_holder)
-        w = canvas.get_tk_widget()
-        w.pack(fill="both", expand=True)  # expand SOLO dentro del holder fijo
 
     # =========================
     # TAB: Comparador
@@ -4073,13 +4070,6 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         self.custom_fig = fig
         self.custom_ax = ax
         self.custom_canvas = canvas
-        chart_holder = ctk.CTkFrame(self, width=900, height=320)
-        chart_holder.pack(fill="x", padx=10, pady=10)  # NO expand
-        chart_holder.pack_propagate(False)  # ✅ evita que se achique
-
-        canvas = FigureCanvasTkAgg(fig, master=chart_holder)
-        w = canvas.get_tk_widget()
-        w.pack(fill="both", expand=True)  # expand SOLO dentro del holder fijo
 
     def add_factor(self):
         app = self.comp_menu.get()
@@ -7449,6 +7439,7 @@ class KClientApp(ctk.CTk):
                 on_pick_user=self._perf_pick_user,
                 on_refresh=self._trigger_refresh_perf,
                 on_load_all=lambda d=None: self.request_all_users_stats(d),
+                on_request_ai_log=self._request_ai_log_from_server,
             )
             self.perf_view.pack(fill="both", expand=True, padx=16, pady=16)
 
