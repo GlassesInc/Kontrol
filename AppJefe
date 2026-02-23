@@ -2059,7 +2059,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         right = ctk.CTkFrame(root, fg_color=PANEL, corner_radius=14, border_width=1, border_color=BORDER)
         right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        right.grid_rowconfigure(8, weight=1)
+        right.grid_rowconfigure(9, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
         # ---- header izquierda
@@ -2099,10 +2099,6 @@ class PerfomanceView(ctk.CTkFrame):
         # Setear límites por defecto
         self._adv_apply_axes_limits()
 
-        # ---- panel derecho
-        ctk.CTkLabel(right, text="Controles", font=("Roboto", 14, "bold"), text_color=TXT).grid(
-            row=0, column=0, sticky="w", padx=12, pady=(12, 6)
-        )
         # ---- panel derecho (header)
         head_r = ctk.CTkFrame(right, fg_color="transparent")
         head_r.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
@@ -2140,7 +2136,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         # Botones
         btn_row = ctk.CTkFrame(right, fg_color="transparent")
-        btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 10))
+        btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 6))
         btn_row.grid_columnconfigure(0, weight=1)
         btn_row.grid_columnconfigure(1, weight=1)
 
@@ -2167,17 +2163,17 @@ class PerfomanceView(ctk.CTkFrame):
             fg_color="#7f1d1d",
             hover_color="#991b1b",
             command=self._adv_reset_all
-        ).grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 6))
+        ).grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 6))
 
         mode_row = ctk.CTkFrame(right, fg_color="transparent")
-        mode_row.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 6))
+        mode_row.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 6))
         mode_row.grid_columnconfigure((0, 1, 2), weight=1)
         ctk.CTkButton(mode_row, text="KPI (general)", command=lambda: self._adv_set_kpi_mode("general")).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ctk.CTkButton(mode_row, text="Por tareas", command=lambda: self._adv_set_kpi_mode("tasks")).grid(row=0, column=1, sticky="ew", padx=2)
         ctk.CTkButton(mode_row, text="€ por hora", command=lambda: self._adv_set_kpi_mode("salary")).grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         self.adv_kpi_mode_lbl = ctk.CTkLabel(right, text="Modo KPI IA: general", font=("Roboto", 11), text_color="#a9bfd8")
-        self.adv_kpi_mode_lbl.grid(row=5, column=0, sticky="w", padx=12, pady=(0, 6))
+        self.adv_kpi_mode_lbl.grid(row=6, column=0, sticky="w", padx=12, pady=(0, 6))
 
         ctk.CTkButton(
             right,
@@ -2185,16 +2181,16 @@ class PerfomanceView(ctk.CTkFrame):
             fg_color="#8e44ad",
             hover_color="#6d2f8a",
             command=self._adv_export_analysis
-        ).grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 8))
+        ).grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 8))
 
         # Listado usuarios
         ctk.CTkLabel(right, text="Usuarios añadidos", font=("Roboto", 12, "bold"), text_color=TXT).grid(
-            row=7, column=0, sticky="w", padx=12, pady=(8, 4)
+            row=8, column=0, sticky="w", padx=12, pady=(6, 4)
         )
 
         self._adv_users_box = ctk.CTkTextbox(right, height=160, fg_color="#0b111a", text_color="#dbe9ff",
                                              font=("Consolas", 11), corner_radius=12)
-        self._adv_users_box.grid(row=8, column=0, sticky="nsew", padx=12, pady=(0, 10))
+        self._adv_users_box.grid(row=9, column=0, sticky="nsew", padx=12, pady=(0, 10))
         self._adv_refresh_users_box()
 
         # Nota mensual
@@ -2203,7 +2199,7 @@ class PerfomanceView(ctk.CTkFrame):
             text=f"Mes: {self.adv_days_per_month} días · Efectivo = Real / max(KPI, 20%)",
             font=("Roboto", 11),
             text_color=MUT
-        ).grid(row=9, column=0, sticky="w", padx=12, pady=(0, 12))
+        ).grid(row=10, column=0, sticky="w", padx=12, pady=(0, 12))
 
         # si venía corriendo y re-renderizaste el tab, asegurate de redibujar líneas
         self._adv_redraw_all_lines()
@@ -7967,4 +7963,3 @@ class KClientApp(ctk.CTk):
 if __name__ == "__main__":
     app = KClientApp()
     app.mainloop()
-
