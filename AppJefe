@@ -1674,12 +1674,9 @@ class PerfomanceView(ctk.CTkFrame):
                     except Exception:
                         pass
 
-                # Scoreboard global del día
-                if callable(getattr(self, "on_load_all", None)):
-                    try:
-                        self.on_load_all(iso)
-                    except Exception:
-                        pass
+                # NOTA: no disparamos barrido global automático al cambiar día.
+                # Esto evitó duplicados/solapes de REQUEST_USER_STATS y respuestas pisadas.
+                # El scoreboard puede refrescarse bajo demanda desde su propia UI.
 
         except Exception:
             pass
@@ -7562,6 +7559,13 @@ class KClientApp(ctk.CTk):
 
         # ✅ Detectar inicio de bloque USER_STATS
         if line.startswith("USER_STATS|"):
+            # Si llega un nuevo header y había bloque pendiente, flush inmediato del anterior
+            if self._stats_block_active:
+                try:
+                    self._flush_user_stats_block()
+                except Exception:
+                    pass
+
             parts = line.split("|")
             # Formato: USER_STATS|user|date|status|active|inactive|history_escaped
             if len(parts) >= 6:
