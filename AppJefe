@@ -2253,49 +2253,198 @@ class PerfomanceView(ctk.CTkFrame):
 
     def _adv_export_analysis(self):
         try:
+            from fpdf import FPDF
+
             export_dir = os.path.join(get_appdata_base_dir(), "exports_analisis")
             os.makedirs(export_dir, exist_ok=True)
+
             day = self._adv_get_selected_day()
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base = os.path.join(export_dir, f"adv_{day}_{ts}")
+            base_name = f"adv_{day}_{ts}"
+            base = os.path.join(export_dir, base_name)
 
             img_path = base + ".png"
             if self.adv_fig is not None:
                 self.adv_fig.savefig(img_path, dpi=140, bbox_inches="tight")
 
+            def clean_pdf_text(x: str) -> str:
+                t = str(x or "")
+                t = t.replace("€", "EUR")
+                return t.encode("latin-1", "ignore").decode("latin-1")
+
+            def low_perf_from_raw(raw: str, top_n: int = 8):
+                out = []
+                if not isinstance(raw, str) or not raw.strip():
+                    return out
+                for ln in raw.splitlines():
+                    ln = ln.strip()
+                    if not ln.startswith(">"):
+                        continue
+                    m = re.search(r"\[([^\]]+)\]", ln)
+                    if not m:
+                        continue
+                    dur = m.group(1).strip()
+                    try:
+                        sec = int(self.parse_time_to_seconds(dur) or 0)
+                    except Exception:
+                        sec = 0
+                    if sec <= 0:
+                        continue
+                    name = ln.split("[", 1)[0].replace(">", "").strip()
+                    low = name.lower()
+                    if any(k in low for k in DISTRACTION_KEYWORDS):
+                        out.append((name, sec))
+                out.sort(key=lambda x: x[1], reverse=True)
+                return out[:top_n]
+
+            # contexto por usuario
             lines = [f"Fecha seleccionada: {day}", f"Modo KPI IA: {self.adv_kpi_mode}", "", "Usuarios:"]
+            low_perf_global = []
             for u in (self.adv_users or []):
                 real_s, eff_s, kpi_pct = self._adv_user_cost_per_sec(u)
-                lines.append(f"- {u.get('name')} | rol={u.get('role')} | €/h={u.get('eur_per_hour')} | KPI={kpi_pct}% | real={real_s:.4f} | eff={eff_s:.4f}")
+                name = (u.get('name') or '').strip()
+                role = u.get('role')
+                eur_h = u.get('eur_per_hour')
+                lines.append(f"- {name} | rol={role} | EUR/h={eur_h} | KPI={kpi_pct}% | real={real_s:.4f} | eff={eff_s:.4f}")
 
-            summary = "Resumen: comportamiento dentro de lo esperable para la jornada. Revisar desvíos si la línea efectiva crece muy por encima de la real."
+                raw = self._adv_get_user_raw_for_ai(name)
+                low_perf = low_perf_from_raw(raw, top_n=5)
+                if low_perf:
+                    lines.append(f"  Actividades que bajan rendimiento ({name}):")
+                    for app, sec in low_perf:
+                        low_perf_global.append((name, app, sec))
+                        lines.append(f"    - {app} [{self.format_seconds(sec)}]")
+
+            # contexto capturas + log IA (análisis de capturas)
+            ai_log_txt = (self._ai_log_text or '').strip()
+            if ai_log_txt:
+                lines.append("")
+                lines.append("Extracto análisis IA de capturas:")
+                lines.extend((ai_log_txt[:7000]).splitlines()[:40])
+
+            shots = []
             try:
-                if os.getenv("OPENAI_API_KEY"):
-                    from openai import OpenAI
-                    client = OpenAI(timeout=20)
-                    prompt = "\n".join(lines) + "\n\nDescribe en 4-6 líneas si la gráfica es normal/esperable y qué mejorar."
-                    resp = client.responses.create(model="gpt-4o-mini", input=[{"role":"user","content":prompt}])
-                else:
-                    resp = None
-                out = ""
-                for item in getattr(resp, "output", []) or []:
-                    if getattr(item, "type", None) == "message":
-                        for c in getattr(item, "content", []) or []:
-                            if getattr(c, "type", None) in ("output_text", "text"):
-                                out += getattr(c, "text", "")
-                if (out or "").strip():
-                    summary = out.strip()
+                day_compact = day.replace("-", "")
+                for fn in sorted(os.listdir(get_cache_dir())):
+                    if day_compact in fn:
+                        shots.append(fn)
             except Exception:
                 pass
 
+            if shots:
+                lines.append("")
+                lines.append(f"Capturas detectadas del día ({len(shots)}):")
+                for fn in shots[:20]:
+                    lines.append(f"- {fn}")
+
+            # resumen IA (con fallback) y mención explícita de actividades que bajan rendimiento
+            summary = (
+                "Resumen: rendimiento dentro de lo esperable. "
+                "Revisar actividades de distracción detectadas y contrastarlas con el rol/tareas."
+            )
+            try:
+                if os.getenv("OPENAI_API_KEY"):
+                    from openai import OpenAI
+                    client = OpenAI(timeout=25)
+                    prompt = (
+                        "Genera un resumen ejecutivo breve del rendimiento diario. "
+                        "Incluye: (1) si el resultado es normal/esperable, "
+                        "(2) actividades concretas que bajan rendimiento, "
+                        "(3) si el análisis de capturas/IA aporta señales relevantes, "
+                        "(4) recomendaciones accionables.\n\n"
+                        + "\n".join(lines)
+                    )
+                    resp = client.responses.create(
+                        model="gpt-4o-mini",
+                        input=[{"role": "user", "content": prompt}]
+                    )
+                    out = ""
+                    for item in getattr(resp, "output", []) or []:
+                        if getattr(item, "type", None) == "message":
+                            for c in getattr(item, "content", []) or []:
+                                if getattr(c, "type", None) in ("output_text", "text"):
+                                    out += getattr(c, "text", "")
+                    if (out or "").strip():
+                        summary = out.strip()
+            except Exception:
+                pass
+
+            # TXT export
             txt_path = base + ".txt"
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
                 f.write("\n\n" + summary + "\n")
 
-            messagebox.showinfo("Exportación", f"Análisis exportado:\n{img_path}\n{txt_path}")
+            # PDF export (incluye gráfica)
+            pdf_path = base + ".pdf"
+            pdf = FPDF(orientation="P", unit="mm", format="A4")
+            pdf.set_margins(12, 12, 12)
+            pdf.set_auto_page_break(auto=True, margin=12)
+            pdf.add_page()
+
+            epw = pdf.w - pdf.l_margin - pdf.r_margin
+            pdf.set_font("Arial", "B", 15)
+            pdf.cell(epw, 8, clean_pdf_text("Analisis estadistica avanzada"), ln=True)
+            pdf.set_font("Arial", "", 11)
+            pdf.cell(epw, 7, clean_pdf_text(f"Fecha seleccionada: {day}"), ln=True)
+            pdf.cell(epw, 7, clean_pdf_text(f"Modo KPI IA: {self.adv_kpi_mode}"), ln=True)
+            pdf.ln(2)
+
+            if os.path.exists(img_path):
+                try:
+                    pdf.image(img_path, x=pdf.l_margin, y=pdf.get_y(), w=epw)
+                    pdf.ln(95)
+                except Exception:
+                    pass
+
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(epw, 7, clean_pdf_text("Resumen IA"), ln=True)
+            pdf.set_font("Arial", "", 10)
+            pdf.multi_cell(epw, 5, clean_pdf_text(summary))
+            pdf.ln(2)
+
+            pdf.set_font("Arial", "B", 11)
+            pdf.cell(epw, 7, clean_pdf_text("Actividades que bajan rendimiento"), ln=True)
+            pdf.set_font("Arial", "", 9)
+            if low_perf_global:
+                for uname, app, sec in low_perf_global[:30]:
+                    pdf.multi_cell(epw, 5, clean_pdf_text(f"- {uname}: {app} [{self.format_seconds(sec)}]"))
+            else:
+                pdf.multi_cell(epw, 5, clean_pdf_text("No se detectaron actividades de baja productividad con tiempo significativo."))
+
+            if shots:
+                pdf.ln(2)
+                pdf.set_font("Arial", "B", 11)
+                pdf.cell(epw, 7, clean_pdf_text("Capturas consideradas"), ln=True)
+                pdf.set_font("Arial", "", 9)
+                for fn in shots[:20]:
+                    pdf.multi_cell(epw, 5, clean_pdf_text(f"- {fn}"))
+
+            if ai_log_txt:
+                pdf.ln(2)
+                pdf.set_font("Arial", "B", 11)
+                pdf.cell(epw, 7, clean_pdf_text("Extracto analisis IA de capturas"), ln=True)
+                pdf.set_font("Courier", "", 8)
+                snippet = clean_pdf_text(ai_log_txt[:5000])
+                pdf.multi_cell(epw, 4, snippet)
+
+            pdf.output(pdf_path)
+
+            # guardar también en Descargas
+            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            if os.path.isdir(downloads_dir):
+                try:
+                    shutil.copy2(pdf_path, os.path.join(downloads_dir, os.path.basename(pdf_path)))
+                except Exception:
+                    pass
+
+            messagebox.showinfo(
+                "Exportación",
+                f"Análisis exportado:\n{img_path}\n{txt_path}\n{pdf_path}"
+            )
         except Exception as e:
             messagebox.showerror("Exportación", f"No se pudo exportar análisis: {e}")
+
 
     def _adv_reset_all(self):
         from tkinter import messagebox
