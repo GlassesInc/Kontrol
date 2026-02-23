@@ -174,7 +174,7 @@ class TerminalServer:
         self.ai_max_mem = 80  # rolling memory por user
         self.ai_last_summary = {}  # user -> string resumen anterior
         self.ai_memory = {}  # user -> deque[str] (últimas entradas)
-        self.ai_queue = deque(maxlen=5000)  # cola global de capturas a analizar
+        self.ai_queue = deque(maxlen=20000)  # cola global de capturas a analizar
         self.ai_queue_lock = threading.Lock()
 
         # Logs diarios IA
@@ -858,6 +858,25 @@ class TerminalServer:
                 st["last_fwd_ts"] = now
 
             return should_save, should_fwd
+
+    def _capture_tag_from_filename(self, fname: str) -> str:
+        """
+        Extrae TAG del patrón <user>_<TAG>_<YYYYMMDD_HHMMSS>.jpg/png.
+        Si no puede parsear, devuelve "".
+        """
+        try:
+            base = os.path.basename(fname or "")
+            stem = os.path.splitext(base)[0]
+            parts = stem.rsplit("_", 2)
+            if len(parts) == 3:
+                return (parts[1] or "").strip().upper()
+            return ""
+        except Exception:
+            return ""
+
+    def _is_auto_capture_tag(self, tag: str) -> bool:
+        t = (tag or "").strip().upper()
+        return t.startswith("AUTO")
 
     def load_user_data_to_ram(self):
         with self.file_lock:
@@ -2200,6 +2219,9 @@ class TerminalServer:
                                     # ✅ IA: analizar TODAS las capturas que lleguen (independiente del throttle)
                                     try:
                                         with self.ai_queue_lock:
+                                            q_was_full = (self.ai_queue.maxlen is not None and len(self.ai_queue) >= self.ai_queue.maxlen)
+                                            if q_was_full:
+                                                self.log_to_console("AI queue llena: se descartará el item más viejo.", "WARN")
                                             self.ai_queue.append({
                                                 "user": user,
                                                 "png": final_img,
@@ -2210,7 +2232,14 @@ class TerminalServer:
                                         self.log_to_console(f"No se pudo encolar IA: {e}", "ERR")
 
                                     # ✅ decidir si guardo / reenvío
+                                    cap_tag = self._capture_tag_from_filename(fname)
+                                    manual_from_boss = not self._is_auto_capture_tag(cap_tag)
+
+                                    # AUTO => throttle normal. Manual/vigilancia/pedida por jefe => guardar siempre.
                                     should_save, should_fwd = self._ss_tick_and_decide(user)
+                                    if manual_from_boss:
+                                        should_save = True
+                                        should_fwd = True
 
                                     if should_save:
                                         ensure_dir(self.capturas_dir)

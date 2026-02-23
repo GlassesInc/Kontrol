@@ -5232,6 +5232,13 @@ class KClientApp(ctk.CTk):
             "SYNC_CHECK|",
             "AI_LOG_DATA|",
             "AI_CHAT_RESP|",
+            "HIST_DATES|",
+            "HIST_DATA|",
+            "DISTRACTION_CFG|",
+            "TASKS_SYNC|",
+            "TASK_EVT|",
+            "REWARDS_SYNC|",
+            "REWARD_EVT|",
             "PONG",
         )
         return line.startswith(prefixes)
