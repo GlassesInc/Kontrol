@@ -1,0 +1,3708 @@
+# ✅ PEGAR TODO ESTE BLOQUE EN tasks_module.py
+# (Incluye: DRAG FIX robusto + selector de color con 16 colores (popup))
+#
+# 1) Añade PALETTE + ColorPickerPopup + botón "Elegir" en TaskEditor
+# 2) Arregla DRAG: targets reales (cell) + bind global Motion/Release en toplevel
+
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import messagebox
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Optional, Callable, Any, Tuple
+import os
+import json
+import uuid
+import time
+
+
+# =========================
+# Colores default (podés sobreescribir desde app)
+# =========================
+DEFAULT_THEME = {
+    "TURQ": "#19d3c5",
+    "NAVY": "#0b1b2b",
+    "WHITE": "#ffffff",
+    "CARD": "#142235",
+    "CARD2": "#101a2a",
+    "MUTED": "#9aa7b3",
+    "DANGER": "#e74c3c",
+    "OK": "#2ecc71",
+    "WARN": "#f1c40f",
+}
+
+# ✅ PALETA (16 colores) para elegir sin escribir HEX
+COLOR_PALETTE_16 = [
+    "#19d3c5", "#2ecc71", "#f1c40f", "#e67e22",
+    "#e74c3c", "#9b59b6", "#3498db", "#1abc9c",
+    "#16a085", "#27ae60", "#2980b9", "#8e44ad",
+    "#2c3e50", "#7f8c8d", "#d35400", "#c0392b",
+]
+
+# Altura fija por semana en la vista mensual (ajustá a gusto: 95–140 suele ir bien)
+WEEK_ROW_H = 120
+DAY_HEADER_H = 26  # alto del numerito del día
+# =========================
+# ✅ Meses en Español (sin depender de locale del sistema)
+# =========================
+MONTHS_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
+]
+
+def _month_label_es(d: date) -> str:
+    try:
+        return f"{MONTHS_ES[d.month - 1].capitalize()} {d.year}"
+    except Exception:
+        return d.strftime("%B %Y")
+
+# =========================
+# ✅ Semana ISO (para reset semanal)
+# =========================
+def _current_week_id(d: Optional[date] = None) -> str:
+    d = d or date.today()
+    iso = d.isocalendar()  # (year, week, weekday)
+    return f"{iso[0]}-W{int(iso[1]):02d}"
+
+def _week_start_monday(d: Optional[date] = None) -> date:
+    d = d or date.today()
+    return d - timedelta(days=d.weekday())  # lunes
+
+def _week_totals_file() -> str:
+    return os.path.join(_get_appdata_base_dir(), "week_totals.json")
+
+def _week_totals_archive_file() -> str:
+    return os.path.join(_get_appdata_base_dir(), "week_totals_archive.jsonl")
+
+# =========================
+# AppData / Persistencia
+# =========================
+def _get_appdata_base_dir() -> str:
+    base = os.getenv("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(base, "CSDViajes", "ProdManager")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def _tasks_file() -> str:
+    return os.path.join(_get_appdata_base_dir(), "tasks.json")
+
+def _events_file() -> str:
+    return os.path.join(_get_appdata_base_dir(), "events.jsonl")
+def _templates_dir() -> str:
+    folder = os.path.join(_get_appdata_base_dir(), "templates")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def _templates_file() -> str:
+    return os.path.join(_templates_dir(), "templates.json")
+def _tags_file() -> str:
+    return os.path.join(_get_appdata_base_dir(), "tags.json")
+
+class TagsStore:
+    def __init__(self):
+        self.tags: List[str] = []
+        self.load()
+
+    def load(self):
+        path = _tags_file()
+        if not os.path.exists(path):
+            self.tags = []
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.tags = json.load(f) or []
+        except Exception:
+            self.tags = []
+
+    def save(self):
+        try:
+            with open(_tags_file(), "w", encoding="utf-8") as f:
+                json.dump(self.tags[-50:], f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def add(self, tag: str):
+        tag = (tag or "").strip()
+        if not tag:
+            return
+        # evita duplicados
+        if tag in self.tags:
+            # lo movemos al final (reciente)
+            self.tags = [t for t in self.tags if t != tag] + [tag]
+        else:
+            self.tags.append(tag)
+        self.save()
+
+    def recent(self, n=10) -> List[str]:
+        return list(reversed(self.tags[-n:]))
+
+class TemplatesStore:
+    def __init__(self):
+        self.templates: Dict[str, Dict[str, Any]] = {}
+        self.load()
+
+    def load(self):
+        path = _templates_file()
+        if not os.path.exists(path):
+            self.templates = {}
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.templates = json.load(f) or {}
+        except Exception:
+            self.templates = {}
+
+    def save(self):
+        try:
+            with open(_templates_file(), "w", encoding="utf-8") as f:
+                json.dump(self.templates, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def names(self) -> List[str]:
+        return sorted(self.templates.keys())
+
+    def get(self, name: str) -> Optional[Dict[str, Any]]:
+        return self.templates.get(name)
+
+    def upsert(self, name: str, payload: Dict[str, Any]):
+        self.templates[name] = payload
+        self.save()
+
+
+# =========================
+# Modelos
+# =========================
+WORK_TYPES = ["Dirección", "Administración", "Ventas", "Operativo"]
+PRIORITIES = ["Baja", "Media", "Alta", "Urgente"]
+STATUSES = ["NEW", "IN_PROGRESS", "PAUSED", "BLOCKED", "DONE", "CANCELLED"]
+TASK_TYPES = ["Empresa", "Personal"]
+
+
+@dataclass
+class TimeEntry:
+    mode: str  # "TIMER" o "MANUAL"
+    actor: str
+    start_at: Optional[str] = None  # ISO
+    stop_at: Optional[str] = None   # ISO
+    duration_sec: int = 0
+    note: str = ""
+
+
+@dataclass
+class Task:
+    task_id: str
+    title: str
+    description: str = ""
+    expediente_id: str = ""
+    tags: List[str] = field(default_factory=list)
+
+    task_type: str = "Empresa"  # Empresa/Personal
+    priority: str = "Media"     # Baja/Media/Alta/Urgente
+    color: str = "#19d3c5"
+    work_type: str = "Operativo"  # Dirección/Administración/Ventas/Operativo
+    # ✅ Hora (opcional) para ordenar y mostrar dentro del día
+    scheduled_time: str = ""   # "HH:MM" opcional
+    # Origen externo (ej: Google Calendar)
+    source: str = ""          # "google_calendar"
+    source_id: str = ""       # id del evento (ej: "65735")
+    source_meta: Dict[str, Any] = field(default_factory=dict)  # opcional (titulo real, link, etc)
+
+    # ✅ Repetición (recurrencias)
+    repeat_enabled: bool = False
+    repeat_kind: str = "NONE"      # "NONE" | "WEEKLY" | "MONTHLY" | "YEARLY"
+    repeat_time: str = ""          # "HH:MM" opcional (para copias)
+    repeat_weeks: int = 0          # para WEEKLY
+    repeat_days: List[int] = field(default_factory=list)  # 0..6 (lun..dom)
+    repeat_count: int = 0          # para MONTHLY/YEARLY (cantidad de repeticiones)
+
+    # ✅ Link a tarea base si es copia
+    parent_task_id: str = ""
+
+    created_at: str = ""
+    scheduled_for: str = ""  # YYYY-MM-DD
+    due_at: str = ""         # ISO opcional
+    completed_at: str = ""   # ISO
+
+    owner: str = ""
+    assignee: str = ""
+    delegated_by: str = ""
+
+    status: str = "NEW"
+    blocked_reason: str = ""
+
+    time_total_sec: int = 0
+    time_entries: List[TimeEntry] = field(default_factory=list)
+
+
+# =========================
+# Eventos (para IA futura)
+# =========================
+def _write_event(event: Dict[str, Any]):
+    try:
+        with open(_events_file(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _event(actor: str, task_id: str, event_type: str, metadata: Dict[str, Any]):
+    _write_event({
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "actor": actor,
+        "task_id": task_id,
+        "event_type": event_type,
+        "metadata": metadata or {},
+    })
+
+
+# =========================
+# Store local (offline, enchufable al server luego)
+# =========================
+class LocalTasksStore:
+    def __init__(self):
+        self.tasks: Dict[str, Task] = {}
+        self.load()
+
+    def load(self):
+        path = _tasks_file()
+        if not os.path.exists(path):
+            self.tasks = {}
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            self.tasks = {}
+            for item in raw.get("tasks", []):
+                entries = [TimeEntry(**e) for e in item.get("time_entries", [])]
+                item["time_entries"] = entries
+
+                # ✅ FIX: filtrar keys desconocidas
+                allowed = set(Task.__dataclass_fields__.keys())
+                clean = {k: v for k, v in item.items() if k in allowed}
+
+                t = Task(**clean)
+                self.tasks[t.task_id] = t
+
+        except Exception:
+            self.tasks = {}
+
+    def save(self):
+        try:
+            payload = {"tasks": [self._serialize_task(t) for t in self.tasks.values()]}
+            with open(_tasks_file(), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _serialize_task(t: Task) -> Dict[str, Any]:
+        d = asdict(t)
+        d["time_entries"] = [asdict(e) for e in t.time_entries]
+        return d
+
+    def list_tasks(self) -> List[Task]:
+        return list(self.tasks.values())
+
+    def upsert(self, t: Task):
+        self.tasks[t.task_id] = t
+        self.save()
+
+    def delete(self, task_id: str):
+        if task_id in self.tasks:
+            del self.tasks[task_id]
+            self.save()
+
+
+# =========================
+# API enchufable (server o local)
+# =========================
+class TasksAPI:
+    def fetch_tasks(self, context: Dict[str, Any]) -> List[Task]:
+        raise NotImplementedError
+
+    def delete_task(self, context: Dict[str, Any], task_id: str):
+        raise NotImplementedError
+
+    def create_task(self, context: Dict[str, Any], task: Task) -> Task:
+        raise NotImplementedError
+
+    def update_task(self, context: Dict[str, Any], task: Task) -> Task:
+        raise NotImplementedError
+
+    def add_time_entry(self, context: Dict[str, Any], task_id: str, entry: TimeEntry) -> Task:
+        raise NotImplementedError
+
+
+class LocalAPI(TasksAPI):
+    def __init__(self, store: LocalTasksStore):
+        self.store = store
+
+    def delete_task(self, context: Dict[str, Any], task_id: str):
+        self.store.delete(task_id)
+
+    def fetch_tasks(self, context: Dict[str, Any]) -> List[Task]:
+        role = context.get("role", "employee")
+        me = context.get("user_id", "")
+        visible_users = context.get("visible_users", [me])
+
+        all_tasks = self.store.list_tasks()
+
+        def can_see(t: Task) -> bool:
+            if role == "boss":
+                return True if "ALL" in visible_users else (t.assignee in visible_users)
+            return t.assignee == me
+
+        return [t for t in all_tasks if can_see(t)]
+
+    def create_task(self, context: Dict[str, Any], task: Task) -> Task:
+        self.store.upsert(task)
+        return task
+
+    def update_task(self, context: Dict[str, Any], task: Task) -> Task:
+        self.store.upsert(task)
+        return task
+
+    def add_time_entry(self, context: Dict[str, Any], task_id: str, entry: TimeEntry) -> Task:
+        t = self.store.tasks.get(task_id)
+        if not t:
+            raise ValueError("Task no encontrada")
+        t.time_entries.append(entry)
+        t.time_total_sec += int(entry.duration_sec or 0)
+        if t.time_total_sec < 0:
+            t.time_total_sec = 0
+        self.store.upsert(t)
+        return t
+
+
+# =========================
+# Utilidades UI
+# =========================
+def _fmt_sec(sec: int) -> str:
+    sec = int(sec or 0)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h > 0:
+        return f"{h}h {m}m"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+def _today_str() -> str:
+    return date.today().isoformat()
+import re
+GCAL_SOURCE = "google_calendar"
+
+def _parse_gcal_week_text(raw: str) -> List[Tuple[str, str]]:
+    """
+    Entrada esperada:
+    - 2026-02-03 | 65735
+    - 2026-02-04 | 342ew
+    Devuelve: [(date_iso, event_id), ...]
+    """
+    out: List[Tuple[str, str]] = []
+    if not raw:
+        return out
+
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line.startswith("-"):
+            continue
+
+        # soporta: "- 2026-02-03 | 65735"
+        m = re.match(r"^\-\s*(\d{4}\-\d{2}\-\d{2})\s*\|\s*(.+?)\s*$", line)
+        if not m:
+            continue
+
+        day = m.group(1).strip()
+        eid = m.group(2).strip()
+        if not day or not eid:
+            continue
+
+        out.append((day, eid))
+    return out
+
+def _iso_to_es_date(s: str) -> str:
+    """YYYY-MM-DD -> DD-MM-YYYY (solo display)"""
+    try:
+        if not s:
+            return ""
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s.strip())
+        if not m:
+            return s
+        y, mo, d = m.group(1), m.group(2), m.group(3)
+        return f"{d}-{mo}-{y}"
+    except Exception:
+        return s
+
+def _es_to_iso_date(s: str) -> str:
+    """DD-MM-YYYY o YYYY-MM-DD -> YYYY-MM-DD (para guardar)"""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    m1 = re.match(r"^(\d{2})-(\d{2})-(\d{4})$", s)
+    if m1:
+        d, mo, y = m1.group(1), m1.group(2), m1.group(3)
+        return f"{y}-{mo}-{d}"
+    m2 = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
+    if m2:
+        return s
+    return s  # si es otra cosa, no rompas, pero luego validás
+
+def _iso_now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+def _work_settings_file() -> str:
+    return os.path.join(_get_appdata_base_dir(), "work_settings.json")
+# =========================
+# ✅ Roles
+# =========================
+def _is_jefe(role: str) -> bool:
+    return str(role).strip().lower() == "jefe"
+# =========================
+# ✅ Semanas (histórico semanal)
+# =========================
+def _week_start(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+def _week_key(d: date) -> str:
+    return _week_start(d).isoformat()
+
+def _week_label(week_start_iso: str) -> str:
+    d = date.fromisoformat(week_start_iso)
+    end = d + timedelta(days=6)
+    return f"Semana {d.strftime('%d/%m')} – {end.strftime('%d/%m')}"
+
+DEFAULT_WORK_SETTINGS = {
+    "work_days": [0, 1, 2, 3, 4],     # Lun-Vie
+    "start_time": "09:00",
+    "end_time": "18:00"
+}
+
+def _load_work_settings() -> Dict[str, Any]:
+    try:
+        p = _work_settings_file()
+        if not os.path.exists(p):
+            return dict(DEFAULT_WORK_SETTINGS)
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        out = dict(DEFAULT_WORK_SETTINGS)
+        out.update(d)
+        return out
+    except Exception:
+        return dict(DEFAULT_WORK_SETTINGS)
+
+def _save_work_settings(d: Dict[str, Any]):
+    try:
+        with open(_work_settings_file(), "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _parse_hhmm(s: str) -> Optional[Tuple[int, int]]:
+    s = (s or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if not m:
+        return None
+    hh = int(m.group(1)); mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return None
+    return hh, mm
+
+def _minutes_now() -> int:
+    n = datetime.now()
+    return n.hour * 60 + n.minute
+
+def _minutes_from_hhmm(s: str) -> Optional[int]:
+    p = _parse_hhmm(s)
+    if not p:
+        return None
+    hh, mm = p
+    return hh * 60 + mm
+
+
+class WorkSettingsPopup(ctk.CTkToplevel):
+    def __init__(self, master, theme: Dict[str, str], current: Dict[str, Any], on_save: Callable[[Dict[str, Any]], None]):
+        super().__init__(master)
+        self.theme = theme
+        self.on_save_cb = on_save
+        self.title("Personalizar")
+        self.geometry("900x380")
+        self.configure(fg_color=theme["NAVY"])
+        self.grab_set()
+
+        card = ctk.CTkFrame(self, fg_color=theme["CARD"], corner_radius=16)
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(card, text="Días laborables", text_color=theme["TURQ"], font=("Roboto", 14, "bold"))\
+            .pack(anchor="w", padx=14, pady=(12, 8))
+
+        days_row = ctk.CTkFrame(card, fg_color="transparent")
+        days_row.pack(fill="x", padx=14)
+
+        self.day_vars = []
+        names = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+        cur_days = set(current.get("work_days", DEFAULT_WORK_SETTINGS["work_days"]))
+        for i, nm in enumerate(names):
+            v = tk.IntVar(value=(1 if i in cur_days else 0))
+            self.day_vars.append(v)
+            ctk.CTkCheckBox(days_row, text=nm, variable=v, onvalue=1, offvalue=0).pack(side="left", padx=4)
+
+        ctk.CTkLabel(card, text="Horario laboral", text_color=theme["TURQ"], font=("Roboto", 14, "bold"))\
+            .pack(anchor="w", padx=14, pady=(18, 8))
+
+        hr = ctk.CTkFrame(card, fg_color="transparent")
+        hr.pack(fill="x", padx=14)
+        hr.grid_columnconfigure(1, weight=1)
+        hr.grid_columnconfigure(3, weight=1)
+
+        ctk.CTkLabel(hr, text="Inicio", text_color=theme["MUTED"]).grid(row=0, column=0, sticky="w")
+        self.e_start = ctk.CTkEntry(hr, fg_color=theme["CARD2"])
+        self.e_start.grid(row=0, column=1, sticky="ew", padx=(8, 12))
+        self.e_start.insert(0, current.get("start_time", "09:00"))
+
+        ctk.CTkLabel(hr, text="Fin", text_color=theme["MUTED"]).grid(row=0, column=2, sticky="w")
+        self.e_end = ctk.CTkEntry(hr, fg_color=theme["CARD2"])
+        self.e_end.grid(row=0, column=3, sticky="ew", padx=(8, 0))
+        self.e_end.insert(0, current.get("end_time", "18:00"))
+
+        foot = ctk.CTkFrame(card, fg_color="transparent")
+        foot.pack(fill="x", padx=14, pady=(22, 12))
+
+        ctk.CTkButton(foot, text="Cancelar", fg_color="#22324a", hover_color="#2b3e5b", command=self.destroy)\
+            .pack(side="right", padx=(8, 0))
+
+        ctk.CTkButton(foot, text="Guardar", fg_color=theme["TURQ"], text_color="#001013", hover_color="#12b5aa",
+                      command=self._save)\
+            .pack(side="right")
+
+    def _save(self):
+        work_days = [i for i, v in enumerate(self.day_vars) if int(v.get()) == 1]
+        if not work_days:
+            messagebox.showerror("Error", "Elegí al menos 1 día laborable.")
+            return
+
+        st = (self.e_start.get() or "").strip()
+        en = (self.e_end.get() or "").strip()
+        if _parse_hhmm(st) is None or _parse_hhmm(en) is None:
+            messagebox.showerror("Error", "Horario inválido. Usá HH:MM (ej: 09:00).")
+            return
+
+        d = {"work_days": work_days, "start_time": st, "end_time": en}
+        try:
+            self.on_save_cb(d)
+        except Exception:
+            pass
+        self.destroy()
+
+
+# =========================
+# ✅ POPUP selector de color (16 colores)
+# =========================
+class ColorPickerPopup(ctk.CTkToplevel):
+    def __init__(self, master, theme: Dict[str, str], initial: str, on_pick: Callable[[str], None]):
+        super().__init__(master)
+        self.theme = theme
+        self.on_pick = on_pick
+        self.title("Elegir color")
+        self.geometry("360x240")
+        self.configure(fg_color=theme["NAVY"])
+        self.grab_set()
+
+        card = ctk.CTkFrame(self, fg_color=theme["CARD"], corner_radius=16)
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(card, text="Elegí un color", text_color=theme["TURQ"], font=("Roboto", 14, "bold"))\
+            .pack(anchor="w", padx=14, pady=(12, 8))
+
+        # preview
+        prev_row = ctk.CTkFrame(card, fg_color="transparent")
+        prev_row.pack(fill="x", padx=14, pady=(0, 10))
+
+        self.preview = ctk.CTkFrame(prev_row, fg_color=(initial or theme["TURQ"]), width=28, height=28, corner_radius=8)
+        self.preview.pack(side="left", padx=(0, 10))
+        self.preview.pack_propagate(False)
+
+        self.lbl_hex = ctk.CTkLabel(prev_row, text=(initial or theme["TURQ"]), text_color=theme["WHITE"])
+        self.lbl_hex.pack(side="left")
+
+        grid_sc = ctk.CTkScrollableFrame(card, fg_color="transparent", height=140)
+        grid_sc.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+
+        grid = ctk.CTkFrame(grid_sc, fg_color="transparent")
+        grid.pack(fill="both", expand=True)
+
+
+
+        cols = 4
+        for i, col in enumerate(COLOR_PALETTE_16):
+            r = i // cols
+            c = i % cols
+
+            btn = ctk.CTkButton(
+                grid,
+                text="",
+                width=64,
+                height=36,
+                fg_color=col,
+                hover_color=col,
+                command=lambda cc=col: self._pick(cc)
+            )
+            btn.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+
+        for c in range(cols):
+            grid.grid_columnconfigure(c, weight=1)
+
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.pack(fill="x", padx=14, pady=(0, 12))
+        ctk.CTkButton(bottom, text="Cerrar", fg_color="#22324a", hover_color="#2b3e5b", command=self.destroy)\
+            .pack(side="right")
+
+    def _pick(self, col: str):
+        try:
+            self.preview.configure(fg_color=col)
+            self.lbl_hex.configure(text=col)
+        except Exception:
+            pass
+        try:
+            self.on_pick(col)
+        except Exception:
+            pass
+        self.destroy()
+class BreakPopup(ctk.CTkToplevel):
+    def __init__(self, master, theme: Dict[str, str],
+                 get_elapsed: Callable[[], int],
+                 on_pause: Callable[[], None],
+                 on_start: Callable[[], None],
+                 is_running: Callable[[], bool]):
+        super().__init__(master)
+        self.theme = theme
+        self.get_elapsed = get_elapsed
+        self.on_pause = on_pause
+        self.on_start = on_start
+        self.is_running = is_running
+
+        self.title("Descanso")
+        self.geometry("420x260")
+        self.minsize(420, 260)
+        self.configure(fg_color=theme["NAVY"])
+        self.grab_set()
+
+        card = ctk.CTkFrame(self, fg_color=theme["CARD"], corner_radius=16)
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(card, text="⏸️ Descanso", text_color=theme["TURQ"],
+                     font=("Roboto", 16, "bold")).pack(anchor="w", padx=14, pady=(14, 6))
+
+        self.lbl = ctk.CTkLabel(card, text="00:00", text_color=theme["WARN"],
+                                font=("Roboto", 48, "bold"))
+        self.lbl.pack(pady=(6, 10))
+
+        self.btn = ctk.CTkButton(
+            card,
+            text=("Pausar y cerrar" if self.is_running() else "Iniciar descanso"),
+            fg_color="#22324a",
+            hover_color="#2b3e5b",
+            width=180,
+            command=self._toggle
+        )
+        self.btn.pack(pady=(0, 10))
+
+        ctk.CTkButton(card, text="Cerrar", fg_color="#22324a", hover_color="#2b3e5b",
+                      command=self.destroy).pack()
+
+        self._job = None
+        self._tick()
+
+    def _fmt(self, sec: int) -> str:
+        sec = int(sec or 0)
+        m = sec // 60
+        s = sec % 60
+        return f"{m:02d}:{s:02d}"
+
+    def _tick(self):
+        try:
+            self.lbl.configure(text=self._fmt(self.get_elapsed()))
+            self.btn.configure(text=("Pausar y cerrar" if self.is_running() else "Iniciar descanso"))
+        except Exception:
+            pass
+        self._job = self.after(500, self._tick)
+
+    def _toggle(self):
+        if self.is_running():
+            # pausar y cerrar
+            try:
+                self.on_pause()
+            except Exception:
+                pass
+            try:
+                if self._job:
+                    self.after_cancel(self._job)
+            except Exception:
+                pass
+            self.destroy()
+        else:
+            try:
+                self.on_start()
+            except Exception:
+                pass
+
+class DatePickerPopup(ctk.CTkToplevel):
+    """
+    Mini calendario para elegir una fecha (devuelve ISO YYYY-MM-DD).
+    """
+    def __init__(self, master, theme: Dict[str, str], initial_iso: str, on_pick: Callable[[str], None]):
+        super().__init__(master)
+        self.theme = theme
+        self.on_pick = on_pick
+        self.title("Elegir fecha")
+        self.geometry("360x320")
+        self.configure(fg_color=theme["NAVY"])
+        self.grab_set()
+
+        # mes actual (basado en initial si es válido)
+        try:
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", (initial_iso or "")):
+                y, m, d = map(int, initial_iso.split("-"))
+                self.cur_month = date(y, m, 1)
+            else:
+                self.cur_month = date.today().replace(day=1)
+        except Exception:
+            self.cur_month = date.today().replace(day=1)
+
+        card = ctk.CTkFrame(self, fg_color=theme["CARD"], corner_radius=16)
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+
+        top = ctk.CTkFrame(card, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=(12, 8))
+
+        ctk.CTkButton(top, text="◀", width=44, fg_color="#22324a", hover_color="#2b3e5b",
+                      command=lambda: self._shift_month(-1)).pack(side="left")
+
+        self.lbl = ctk.CTkLabel(top, text=_month_label_es(self.cur_month), text_color=theme["TURQ"],
+                                font=("Roboto", 14, "bold"))
+        self.lbl.pack(side="left", padx=10)
+
+        ctk.CTkButton(top, text="▶", width=44, fg_color="#22324a", hover_color="#2b3e5b",
+                      command=lambda: self._shift_month(+1)).pack(side="right")
+
+        # header días
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.pack(fill="x", padx=12, pady=(0, 6))
+        for i, n in enumerate(["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]):
+            ctk.CTkLabel(head, text=n, text_color=theme["MUTED"]).grid(row=0, column=i, sticky="nsew", padx=2)
+            head.grid_columnconfigure(i, weight=1, uniform="dpcol")
+
+        self.grid = ctk.CTkFrame(card, fg_color="transparent")
+        self.grid.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.pack(fill="x", padx=12, pady=(0, 12))
+        ctk.CTkButton(bottom, text="Hoy", fg_color="#22324a", hover_color="#2b3e5b",
+                      command=self._pick_today).pack(side="left")
+        ctk.CTkButton(bottom, text="Cerrar", fg_color="#22324a", hover_color="#2b3e5b",
+                      command=self.destroy).pack(side="right")
+
+        self._render()
+
+    def _shift_month(self, delta: int):
+        y = self.cur_month.year
+        m = self.cur_month.month + delta
+        while m < 1:
+            m += 12; y -= 1
+        while m > 12:
+            m -= 12; y += 1
+        self.cur_month = date(y, m, 1)
+        self._render()
+
+    def _pick_today(self):
+        iso = date.today().isoformat()
+        try:
+            self.on_pick(iso)
+        except Exception:
+            pass
+        self.destroy()
+
+    def _render(self):
+        for w in self.grid.winfo_children():
+            w.destroy()
+
+        self.lbl.configure(text=_month_label_es(self.cur_month))
+
+        first = self.cur_month
+        start = first - timedelta(days=(first.weekday() % 7))  # lunes
+        days = [start + timedelta(days=i) for i in range(42)]
+
+        cols = 7
+        for c in range(cols):
+            self.grid.grid_columnconfigure(c, weight=1, uniform="dpcol")
+
+        today = date.today()
+        for i, dday in enumerate(days):
+            r = i // 7
+            c = i % 7
+            is_cur = (dday.month == self.cur_month.month)
+            bg = self.theme["CARD2"] if is_cur else "#0f1726"
+            if dday == today:
+                bg = "#1b3552"
+
+            btn = ctk.CTkButton(
+                self.grid,
+                text=str(dday.day),
+                fg_color=bg,
+                hover_color="#2b3e5b",
+                text_color=(self.theme["WHITE"] if is_cur else self.theme["MUTED"]),
+                command=lambda dd=dday: self._pick(dd)
+            )
+            btn.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
+
+    def _pick(self, dd: date):
+        iso = dd.isoformat()
+        try:
+            self.on_pick(iso)
+        except Exception:
+            pass
+        self.destroy()
+
+# =========================
+# MODAL: crear/editar tarea
+# =========================
+class TaskEditor(ctk.CTkToplevel):
+    def __init__(self, master, theme: Dict[str, str], context: Dict[str, Any],
+                 users: List[str], task: Optional[Task],
+                 on_save: Callable[[Task], None]):
+        super().__init__(master)
+        self.theme = theme
+        self.context = context
+        self.users = users
+        self.task = task
+        self.on_save = on_save
+
+        # Templates
+        self.tstore = TemplatesStore()
+        self._templates = self.tstore.names()
+
+        self.title("Tarea")
+        self.geometry("700x560")
+        self.minsize(700, 560)
+        self.configure(fg_color=theme["NAVY"])
+        self.grab_set()
+
+        outer = ctk.CTkFrame(self, fg_color=theme["CARD"], corner_radius=16)
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+
+        # =========================
+        # HEADER
+        # =========================
+        header = ctk.CTkFrame(outer, fg_color="transparent")
+        header.pack(fill="x", padx=14, pady=(14, 8))
+
+        title_txt = "Editar tarea" if task else "Nueva tarea"
+        ctk.CTkLabel(
+            header,
+            text=title_txt,
+            text_color=theme["TURQ"],
+            font=("Roboto", 16, "bold")
+        ).pack(side="left")
+
+        # =========================
+        # TABVIEW (sin scroll)
+        # =========================
+        self.tabview = ctk.CTkTabview(
+            outer,
+            fg_color="transparent"
+        )
+        self.tabview.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+
+        tab_datos = self.tabview.add("Datos")
+        tab_plan = self.tabview.add("Planificación")
+        tab_rep = self.tabview.add("Repetición")
+        tab_notas = self.tabview.add("Notas")
+
+        # =========================
+        # TAB: DATOS
+        # =========================
+        datos = ctk.CTkFrame(tab_datos, fg_color="transparent")
+        datos.pack(fill="both", expand=True)
+
+        datos.grid_columnconfigure(0, weight=1)
+        datos.grid_columnconfigure(1, weight=1)
+
+        self.e_title = ctk.CTkEntry(datos, placeholder_text="Título (obligatorio)", fg_color=theme["CARD2"])
+        self.e_title.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 10))
+
+        # Templates row (+ guardar / ▼ cargar)
+        trow = ctk.CTkFrame(datos, fg_color="transparent")
+        trow.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 10))
+        trow.grid_columnconfigure(1, weight=1)
+
+        self.btn_save_tpl = ctk.CTkButton(
+            trow, text="+", width=44,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=self._save_as_template
+        )
+        self.btn_save_tpl.grid(row=0, column=0, sticky="w")
+
+        self.btn_load_tpl = ctk.CTkOptionMenu(
+            trow,
+            values=(["(sin templates)"] if not self._templates else self._templates),
+            fg_color=theme["CARD2"], button_color=theme["CARD2"],
+            command=self._apply_template
+        )
+        self.btn_load_tpl.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        if not self._templates:
+            self.btn_load_tpl.set("(sin templates)")
+
+        self.e_expe = ctk.CTkEntry(datos, placeholder_text="Expediente (ej: 48392)", fg_color=theme["CARD2"])
+        self.e_expe.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 10))
+
+        self.e_tags = ctk.CTkEntry(datos, placeholder_text="Tags (separados por coma)", fg_color=theme["CARD2"])
+        self.e_tags.grid(row=2, column=1, sticky="ew", padx=6, pady=(0, 10))
+
+        self.tagstore = TagsStore()
+        self._current_tags = []
+        self.tags_suggest = ctk.CTkFrame(datos, fg_color="transparent")
+        self.tags_suggest.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 10))
+
+        def _add_tag_from_entry(_e=None):
+            raw = (self.e_tags.get() or "").strip()
+            if not raw:
+                return
+            token = raw.split(",")[-1].strip()
+            if not token:
+                return
+            if token not in self._current_tags:
+                self._current_tags.append(token)
+                self.tagstore.add(token)
+            self.e_tags.delete(0, "end")
+            self.e_tags.insert(0, ", ".join(self._current_tags) + ", ")
+            self._render_tag_suggestions()
+
+        self.e_tags.bind("<Return>", _add_tag_from_entry)
+
+        self.opt_type = ctk.CTkOptionMenu(datos, values=TASK_TYPES, fg_color=theme["CARD2"], button_color=theme["CARD2"])
+        self.opt_type.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 10))
+
+        self.opt_work = ctk.CTkOptionMenu(datos, values=WORK_TYPES, fg_color=theme["CARD2"], button_color=theme["CARD2"])
+        self.opt_work.grid(row=4, column=1, sticky="ew", padx=6, pady=(0, 10))
+
+        self.opt_prio = ctk.CTkOptionMenu(datos, values=PRIORITIES, fg_color=theme["CARD2"], button_color=theme["CARD2"])
+        self.opt_prio.grid(row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 10))
+
+        # =========================
+        # TAB: PLANIFICACIÓN
+        # =========================
+        plan = ctk.CTkFrame(tab_plan, fg_color="transparent")
+        plan.pack(fill="both", expand=True)
+
+        plan.grid_columnconfigure(0, weight=1)
+        plan.grid_columnconfigure(1, weight=1)
+
+        role = context.get("role", "employee")
+        me = context.get("user_id", "")
+
+        self.opt_assignee = ctk.CTkOptionMenu(plan, values=users, fg_color=theme["CARD2"], button_color=theme["CARD2"])
+        self.opt_assignee.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(10, 10))
+
+        # Programada para
+        sched_wrap = ctk.CTkFrame(plan, fg_color="transparent")
+        sched_wrap.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 10))
+        sched_wrap.grid_columnconfigure(0, weight=1)
+
+        self.e_sched = ctk.CTkEntry(sched_wrap, placeholder_text="Programada para (DD-MM-YYYY)", fg_color=theme["CARD2"])
+        self.e_sched.grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkButton(
+            sched_wrap, text="📅", width=44,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=lambda: self._open_date_picker(self.e_sched)
+        ).grid(row=0, column=1, padx=(10, 0))
+
+        # Vence
+        due_wrap = ctk.CTkFrame(plan, fg_color="transparent")
+        due_wrap.grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 10))
+        due_wrap.grid_columnconfigure(0, weight=1)
+
+        self.e_due = ctk.CTkEntry(due_wrap, placeholder_text="Vence (DD-MM-YYYY opcional)", fg_color=theme["CARD2"])
+        self.e_due.grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkButton(
+            due_wrap, text="📅", width=44,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=lambda: self._open_date_picker(self.e_due)
+        ).grid(row=0, column=1, padx=(10, 0))
+
+        # Color (entry + elegir)
+        color_wrap = ctk.CTkFrame(plan, fg_color="transparent")
+        color_wrap.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 10))
+        color_wrap.grid_columnconfigure(0, weight=1)
+
+        self.e_color = ctk.CTkEntry(color_wrap, placeholder_text="Color HEX (ej: #19d3c5)", fg_color=theme["CARD2"])
+        self.e_color.grid(row=0, column=0, sticky="ew")
+
+        self.btn_pick_color = ctk.CTkButton(
+            color_wrap,
+            text="Elegir",
+            width=90,
+            fg_color="#22324a",
+            hover_color="#2b3e5b",
+            command=self._open_color_picker
+        )
+        self.btn_pick_color.grid(row=0, column=1, padx=(10, 0))
+
+        # Defaults de asignación
+        # Defaults de asignación
+        if not task:
+            # ✅ Si viene desde PerformanceView (o querés forzar), que por defecto sea el propio user
+            force_me = bool(self.context.get("force_assignee_me", False))
+
+            if force_me:
+                self.opt_assignee.set(me or (users[0] if users else ""))
+            else:
+                # comportamiento anterior (pero mejorado: si hay filtro de usuario, lo usa)
+                preferred = (self.context.get("default_assignee") or "").strip()
+
+                if preferred and preferred in users:
+                    self.opt_assignee.set(preferred)
+                else:
+                    self.opt_assignee.set(me if role != "boss" else (users[0] if users else me))
+
+        # =========================
+        # TAB: NOTAS
+        # =========================
+        notas = ctk.CTkFrame(tab_notas, fg_color="transparent")
+        notas.pack(fill="both", expand=True)
+        notas.grid_rowconfigure(0, weight=1)
+        notas.grid_columnconfigure(0, weight=1)
+
+        self.t_desc = ctk.CTkTextbox(notas, fg_color=theme["CARD2"])
+        self.t_desc.grid(row=0, column=0, sticky="nsew", padx=6, pady=(10, 10))
+        # =========================
+        # TAB: REPETICIÓN
+        # =========================
+        rep = ctk.CTkFrame(tab_rep, fg_color="transparent")
+        rep.pack(fill="both", expand=True)
+        rep.grid_columnconfigure(0, weight=1)
+        rep.grid_columnconfigure(1, weight=1)
+
+        self.rep_enable = tk.IntVar(value=0)
+        ctk.CTkCheckBox(rep, text="Activar repetición", variable=self.rep_enable, onvalue=1, offvalue=0)\
+            .grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(10, 10))
+
+        self.opt_rep_kind = ctk.CTkOptionMenu(
+            rep, values=["NONE", "WEEKLY", "MONTHLY", "YEARLY"],
+            fg_color=theme["CARD2"], button_color=theme["CARD2"]
+        )
+        self.opt_rep_kind.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 10))
+        self.opt_rep_kind.set("NONE")
+
+        # Días semana (solo weekly)
+        days = ctk.CTkFrame(rep, fg_color="transparent")
+        days.grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 10))
+        ctk.CTkLabel(days, text="Días (semanal):", text_color=theme["MUTED"]).pack(side="left", padx=(0, 8))
+
+        self.rep_day_vars = []
+        for i, nm in enumerate(["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]):
+            v = tk.IntVar(value=0)
+            self.rep_day_vars.append(v)
+            ctk.CTkCheckBox(days, text=nm, variable=v, onvalue=1, offvalue=0).pack(side="left", padx=2)
+
+        self.e_rep_weeks = ctk.CTkEntry(rep, placeholder_text="Semanas (solo WEEKLY, ej: 4)", fg_color=theme["CARD2"])
+        self.e_rep_weeks.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 10))
+
+        self.e_rep_count = ctk.CTkEntry(rep, placeholder_text="Repeticiones (MONTHLY/YEARLY, ej: 6)", fg_color=theme["CARD2"])
+        self.e_rep_count.grid(row=3, column=1, sticky="ew", padx=6, pady=(0, 10))
+
+        self.e_rep_time = ctk.CTkEntry(rep, placeholder_text="Hora (HH:MM opcional, ej: 10:30)", fg_color=theme["CARD2"])
+        self.e_rep_time.grid(row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 10))
+
+        # =========================
+        # BOTONERA FIJA ABAJO (sin scroll)
+        # =========================
+        bottom = ctk.CTkFrame(outer, fg_color="transparent")
+        bottom.pack(fill="x", padx=14, pady=(0, 14))
+
+        ctk.CTkButton(
+            bottom, text="Cancelar",
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=self.destroy
+        ).pack(side="right", padx=(8, 0))
+
+        ctk.CTkButton(
+            bottom, text="Guardar",
+            fg_color=theme["TURQ"], text_color="#001013",
+            hover_color="#12b5aa",
+            command=self._save
+        ).pack(side="right")
+
+        # =========================
+        # PREFILL
+        # =========================
+        if task:
+            self.e_title.insert(0, task.title)
+            self.e_expe.insert(0, task.expediente_id)
+            self.e_tags.insert(0, ", ".join(task.tags))
+            self._current_tags = list(task.tags or [])
+            self._render_tag_suggestions()
+
+            self.opt_type.set(task.task_type)
+            self.opt_work.set(task.work_type)
+            self.opt_prio.set(task.priority)
+
+            self.e_sched.insert(0, _iso_to_es_date(task.scheduled_for or _today_str()))
+            self.e_due.insert(0, _iso_to_es_date((task.due_at or "")[:10]) if (task.due_at or "") else "")
+
+            self.opt_assignee.set(task.assignee or me)
+            self.e_color.insert(0, task.color or theme["TURQ"])
+            self.t_desc.insert("1.0", task.description or "")
+            # repetición
+            self.rep_enable.set(1 if task.repeat_enabled else 0)
+            self.opt_rep_kind.set(task.repeat_kind or "NONE")
+            for i, v in enumerate(self.rep_day_vars):
+                v.set(1 if i in (task.repeat_days or []) else 0)
+            self.e_rep_weeks.insert(0, str(int(task.repeat_weeks or 0)) if int(task.repeat_weeks or 0) else "")
+            self.e_rep_count.insert(0, str(int(task.repeat_count or 0)) if int(task.repeat_count or 0) else "")
+            self.e_rep_time.insert(0, (task.repeat_time or ""))
+
+        else:
+            self.opt_type.set("Empresa")
+            self.opt_work.set("Operativo")
+            self.opt_prio.set("Media")
+            self.e_sched.insert(0, _iso_to_es_date(_today_str()))
+            self.e_color.insert(0, theme["TURQ"])
+            self._render_tag_suggestions()
+
+
+    def _render_tag_suggestions(self):
+        for w in self.tags_suggest.winfo_children():
+            w.destroy()
+
+        rec = self.tagstore.recent(10)
+        if not rec:
+            return
+
+        ctk.CTkLabel(self.tags_suggest, text="Sugerencias:", text_color=self.theme["MUTED"]).pack(side="left",
+                                                                                                  padx=(0, 8))
+        for tg in rec:
+            btn = ctk.CTkButton(
+                self.tags_suggest,
+                text=tg,
+                height=26,
+                fg_color="#22324a",
+                hover_color="#2b3e5b",
+                command=lambda x=tg: self._pick_suggested_tag(x)
+            )
+            btn.pack(side="left", padx=4)
+
+    def _pick_suggested_tag(self, tg: str):
+        if tg and tg not in self._current_tags:
+            self._current_tags.append(tg)
+            self.tagstore.add(tg)
+        self.e_tags.delete(0, "end")
+        self.e_tags.insert(0, ", ".join(self._current_tags) + ", ")
+        self._render_tag_suggestions()
+
+    def _open_color_picker(self):
+        current = (self.e_color.get().strip() or self.theme["TURQ"])
+
+        def _picked(col: str):
+            try:
+                self.e_color.delete(0, "end")
+                self.e_color.insert(0, col)
+            except Exception:
+                pass
+
+        ColorPickerPopup(self, self.theme, current, _picked)
+    def _open_date_picker(self, entry: ctk.CTkEntry):
+        # entry contiene DD-MM-YYYY (display). Convertimos a ISO para el picker.
+        current_es = (entry.get() or "").strip()
+        current_iso = _es_to_iso_date(current_es) if current_es else date.today().isoformat()
+
+        def _picked(iso: str):
+            try:
+                entry.delete(0, "end")
+                entry.insert(0, _iso_to_es_date(iso))
+            except Exception:
+                pass
+
+        DatePickerPopup(self, self.theme, current_iso, _picked)
+
+    def _template_payload_from_fields(self) -> Dict[str, Any]:
+        return {
+            "title": self.e_title.get().strip(),
+            "description": self.t_desc.get("1.0", "end").strip(),
+            "expediente_id": self.e_expe.get().strip(),
+            "tags": [t.strip() for t in (self.e_tags.get().strip()).split(",") if t.strip()],
+            "task_type": self.opt_type.get().strip(),
+            "work_type": self.opt_work.get().strip(),
+            "priority": self.opt_prio.get().strip(),
+            "color": (self.e_color.get().strip() or self.theme["TURQ"]),
+        }
+
+    def _save_as_template(self):
+        title = self.e_title.get().strip()
+        if not title:
+            messagebox.showerror("Template", "Primero poné un título para poder guardar el template.")
+            return
+
+        dlg = ctk.CTkInputDialog(text="Nombre del template (ej: Cotización vuelo / Revisión expediente)", title="Guardar template")
+        name = (dlg.get_input() or "").strip()
+        if not name:
+            return
+
+        payload = self._template_payload_from_fields()
+        # si el usuario deja title vacío, usa nombre del template como title
+        if not payload.get("title"):
+            payload["title"] = name
+
+        self.tstore.upsert(name, payload)
+
+        # refrescar dropdown
+        self._templates = self.tstore.names()
+        try:
+            self.btn_load_tpl.configure(values=self._templates)
+            self.btn_load_tpl.set(name)
+        except Exception:
+            pass
+
+    def _apply_template(self, name: str):
+        if not name or name == "(sin templates)":
+            return
+        tpl = self.tstore.get(name)
+        if not tpl:
+            return
+
+        # Reemplaza datos, PERO deja al usuario seguir editando libre
+        try:
+            self.e_title.delete(0, "end"); self.e_title.insert(0, tpl.get("title", ""))
+            self.e_expe.delete(0, "end"); self.e_expe.insert(0, tpl.get("expediente_id", ""))
+            self.e_tags.delete(0, "end"); self.e_tags.insert(0, ", ".join(tpl.get("tags", []) or []))
+
+            if tpl.get("task_type") in TASK_TYPES: self.opt_type.set(tpl.get("task_type"))
+            if tpl.get("work_type") in WORK_TYPES: self.opt_work.set(tpl.get("work_type"))
+            if tpl.get("priority") in PRIORITIES: self.opt_prio.set(tpl.get("priority"))
+
+            self.e_color.delete(0, "end"); self.e_color.insert(0, tpl.get("color", self.theme["TURQ"]))
+
+            self.t_desc.delete("1.0", "end")
+            self.t_desc.insert("1.0", tpl.get("description", ""))
+        except Exception:
+            pass
+
+    def _save(self):
+        title = self.e_title.get().strip()
+        if not title:
+            messagebox.showerror("Error", "El título es obligatorio.")
+            return
+
+        expe = self.e_expe.get().strip()
+        if not expe:
+            messagebox.showerror("Error", "El expediente es obligatorio.")
+            return
+        # tags desde lista interna + lo que haya tipeado
+        tags_raw = (self.e_tags.get() or "").strip()
+        typed = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        tags = []
+        for x in (self._current_tags + typed):
+            if x and x not in tags:
+                tags.append(x)
+        for x in tags:
+            self.tagstore.add(x)
+
+        task_type = self.opt_type.get().strip()
+        work_type = self.opt_work.get().strip()
+        prio = self.opt_prio.get().strip()
+        sched_es = self.e_sched.get().strip() or _iso_to_es_date(_today_str())
+        sched = _es_to_iso_date(sched_es) or _today_str()
+
+        due_es = (self.e_due.get().strip() or "")
+        if not due_es:
+            ok = messagebox.askyesno(
+                "Vencimiento",
+                "No le has puesto día de vencimiento a la tarea.\n"
+                "Si continuas se te auto-pondrá para el vencimiento de HOY.\n\n"
+                "¿Querés continuar?"
+            )
+            if not ok:
+                return
+            due = _today_str()
+            # también lo mostramos en UI
+            try:
+                self.e_due.delete(0, "end")
+                self.e_due.insert(0, _iso_to_es_date(due))
+            except Exception:
+                pass
+        else:
+            due_iso = _es_to_iso_date(due_es)
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", (due_iso or "")):
+                messagebox.showerror("Error", "Vencimiento inválido. Usá DD-MM-YYYY.")
+                return
+            due = due_iso
+
+        assignee = self.opt_assignee.get().strip()
+        color = self.e_color.get().strip() or self.theme["TURQ"]
+        desc = self.t_desc.get("1.0", "end").strip()
+
+        if work_type not in WORK_TYPES:
+            messagebox.showerror("Error", "Tipo de trabajo inválido.")
+            return
+
+        now = _iso_now()
+        me = self.context.get("user_id", "")
+        rep_enabled = (int(self.rep_enable.get()) == 1)
+        rep_kind = (self.opt_rep_kind.get().strip() if hasattr(self, "opt_rep_kind") else "NONE")
+
+        rep_days = [i for i, v in enumerate(getattr(self, "rep_day_vars", [])) if int(v.get()) == 1]
+        rep_weeks = 0
+        rep_count = 0
+        rep_time = (self.e_rep_time.get().strip() if hasattr(self, "e_rep_time") else "")
+
+        if rep_time and _parse_hhmm(rep_time) is None:
+            messagebox.showerror("Error", "Hora de repetición inválida. Usá HH:MM.")
+            return
+
+        if rep_enabled and rep_kind == "WEEKLY":
+            try:
+                rep_weeks = int((self.e_rep_weeks.get() or "0").strip())
+            except Exception:
+                rep_weeks = 0
+            if rep_weeks <= 0:
+                messagebox.showerror("Error", "Para WEEKLY poné cuántas semanas (ej: 4).")
+                return
+            if not rep_days:
+                messagebox.showerror("Error", "Para WEEKLY elegí al menos 1 día de la semana.")
+                return
+
+        if rep_enabled and rep_kind in ("MONTHLY", "YEARLY"):
+            try:
+                rep_count = int((self.e_rep_count.get() or "0").strip())
+            except Exception:
+                rep_count = 0
+            if rep_count <= 0:
+                messagebox.showerror("Error", "Para MONTHLY/YEARLY poné cuántas repeticiones (ej: 6).")
+                return
+
+        if not rep_enabled:
+            rep_kind = "NONE"
+            rep_days = []
+            rep_weeks = 0
+            rep_count = 0
+            rep_time = ""
+
+        if self.task:
+            t = self.task
+            t.title = title
+            t.expediente_id = expe
+            t.tags = tags
+            t.task_type = task_type
+            t.work_type = work_type
+            t.priority = prio
+            t.scheduled_for = sched
+            t.due_at = due
+            t.assignee = assignee
+            t.color = color
+            t.description = desc
+            t.repeat_enabled = rep_enabled
+            t.repeat_kind = rep_kind
+            t.repeat_days = rep_days
+            t.repeat_weeks = rep_weeks
+            t.repeat_count = rep_count
+            t.repeat_time = rep_time
+
+        else:
+            t = Task(
+                task_id=str(uuid.uuid4()),
+                title=title,
+                description=desc,
+                expediente_id=expe,
+                tags=tags,
+                task_type=task_type,
+                priority=prio,
+                color=color,
+                work_type=work_type,
+                created_at=now,
+                scheduled_for=sched,
+                due_at=due,
+                owner=me,
+                assignee=assignee or me,
+                status="NEW",
+            )
+            t.repeat_enabled = rep_enabled
+            t.repeat_kind = rep_kind
+            t.repeat_days = rep_days
+            t.repeat_weeks = rep_weeks
+            t.repeat_count = rep_count
+            t.repeat_time = rep_time
+
+
+        self.on_save(t)
+        self.destroy()
+
+import threading
+
+# =========================
+# ✅ Google Calendar Inbox (auto-import)
+# =========================
+
+def _gcal_inbox_file() -> str:
+    # un “buzón” donde tu sync escribe eventos (jsonl)
+    return os.path.join(_get_appdata_base_dir(), "gcal_inbox.jsonl")
+
+def _gcal_inbox_cursor_file() -> str:
+    # guardamos hasta qué byte leímos (para no reimportar)
+    return os.path.join(_get_appdata_base_dir(), "gcal_inbox_cursor.json")
+
+def _load_gcal_cursor() -> int:
+    try:
+        p = _gcal_inbox_cursor_file()
+        if not os.path.exists(p):
+            return 0
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+        return int(d.get("pos", 0) or 0)
+    except Exception:
+        return 0
+
+def _save_gcal_cursor(pos: int):
+    try:
+        with open(_gcal_inbox_cursor_file(), "w", encoding="utf-8") as f:
+            json.dump({"pos": int(pos)}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _safe_json_loads(line: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(line)
+    except Exception:
+        return None
+
+def _gcal_event_to_week_line(ev: Dict[str, Any]) -> Optional[str]:
+    """
+    Convierte un evento del inbox a la línea que ya entiende tu import:
+    "- YYYY-MM-DD | EVENT_ID"
+    """
+    if not isinstance(ev, dict):
+        return None
+
+    event_id = str(ev.get("id", "")).strip()
+    if not event_id:
+        return None
+
+    # date preferida: start.date (all-day) o start.dateTime
+    start = ev.get("start") or {}
+    day_iso = ""
+    if isinstance(start, dict):
+        if start.get("date"):
+            day_iso = str(start.get("date")).strip()
+        elif start.get("dateTime"):
+            # "2026-02-03T10:00:00-05:00" -> "2026-02-03"
+            day_iso = str(start.get("dateTime"))[:10].strip()
+
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day_iso):
+        return None
+
+    return f"- {day_iso} | {event_id}"
+
+class _GCalInboxWatcher(threading.Thread):
+    """
+    Hilo: lee gcal_inbox.jsonl incrementalmente y pide import en el UI thread.
+    """
+    def __init__(self, module_ref, poll_sec: float = 3.0):
+        super().__init__(daemon=True)
+        self.mod = module_ref
+        self.poll_sec = float(poll_sec)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        while not self._stop:
+            try:
+                self._tick()
+            except Exception:
+                pass
+            time.sleep(self.poll_sec)
+
+    def _tick(self):
+        path = _gcal_inbox_file()
+        if not os.path.exists(path):
+            return
+
+        pos = _load_gcal_cursor()
+        size = os.path.getsize(path)
+        if size < pos:
+            # si el archivo se truncó/rotó
+            pos = 0
+
+        new_lines = []
+        with open(path, "r", encoding="utf-8") as f:
+            f.seek(pos)
+            for line in f:
+                line = (line or "").strip()
+                if line:
+                    new_lines.append(line)
+            pos = f.tell()
+
+        if not new_lines:
+            _save_gcal_cursor(pos)
+            return
+
+        # Convertimos eventos -> texto importable por tu función existente
+        week_lines = []
+        for ln in new_lines:
+            ev = _safe_json_loads(ln)
+            if not ev:
+                continue
+            wline = _gcal_event_to_week_line(ev)
+            if wline:
+                week_lines.append(wline)
+
+        # guardamos cursor SIEMPRE (aunque haya basura)
+        _save_gcal_cursor(pos)
+
+        if not week_lines:
+            return
+
+        raw_text = "\n".join(week_lines)
+
+        # 🔥 IMPORTAR en el thread de UI (tkinter)
+        def _do_import():
+            try:
+                # Podés forzar assignee (por defecto se asigna al user actual)
+                created = self.mod.import_google_calendar_week(raw_text, assignee=self.mod.context.get("user_id", ""))
+                if created:
+                    self.mod._notify("Google Calendar", f"Importadas {created} tareas desde Calendar.")
+            except Exception:
+                pass
+
+        try:
+            # after(0, ...) asegura UI thread
+            self.mod.after(0, _do_import)
+        except Exception:
+            pass
+
+# =========================
+# TasksModule (Frame compartido)
+# =========================
+class TasksModule(ctk.CTkFrame):
+    def __init__(self, master, context: Dict[str, Any], api: Optional[TasksAPI] = None,
+                 theme: Optional[Dict[str, str]] = None,
+                 on_request_user_list: Optional[Callable[[], List[str]]] = None):
+        self.theme = dict(DEFAULT_THEME)
+        if theme:
+            self.theme.update(theme)
+
+        super().__init__(master, fg_color=self.theme["NAVY"])
+        self.context = context or {}
+        self.store = LocalTasksStore()
+        self.api = api or LocalAPI(self.store)
+
+        self.on_request_user_list = on_request_user_list
+
+        self.tasks: List[Task] = []
+        self.filtered_tasks: List[Task] = []
+        self.selected_user_filter = "ALL"
+        self.selected_task_id: Optional[str] = None
+
+        # Timer state
+        self.timer_task_id: Optional[str] = None
+        self.timer_running = False
+        self.timer_start_ts = 0.0
+        self.timer_elapsed_sec = 0
+        self.timer_after_id = None
+        # ✅ Labels de timer en chips (Agenda)
+        self._chip_timer_labels: Dict[str, ctk.CTkLabel] = {}
+
+        # ✅ Notificaciones (10 min sin timer / 15 min timer corriendo)
+        # ✅ Notificaciones (configurable)
+        self._notif_idle_start_ts = None  # se setea cuando realmente estás idle
+        self._notif_idle_sent = False
+        self._notif_running_sent = False
+        self._notif_job = None
+        # ✅ Repetición de notificaciones
+
+        # ✅ Auto-import Google Calendar inbox
+        self._gcal_watcher = None
+        self._start_gcal_inbox_watcher()
+
+        self._notif_idle_last_ts = 0.0
+        self._notif_running_last_ts = 0.0
+
+        # ✅ Ajustes (segundos)
+        self.NOTIF_CHECK_EVERY_MS = 10000000
+        self.NOTIF_NO_TIMER_SEC = 60000000
+        self.NOTIF_TIMER_RUNNING_SEC = 9000000
+        self.NOTIF_REPEAT_IDLE_SEC = 10000000
+        self.NOTIF_REPEAT_RUNNING_SEC = 1000000
+        self.work_settings = _load_work_settings()
+        self._eod_notif_sent = {}  # key: f"{task_id}:{threshold_min}" -> date iso
+
+        # ✅ Descanso
+        self.break_running = False
+        self.break_start_ts = 0.0
+        self.break_elapsed_sec = 0
+        self.break_after_id = None
+        self.break_save_job = None
+        self._load_break_state()
+        # =========================
+        # ✅ Semana actual (solo Jefe)
+        # =========================
+        self.week_selected = _week_key(date.today())
+
+        # ✅ Semana actual + totales semanales (contador separado)
+        wk = self._load_week_totals()
+        self._week_id = wk.get("week_id") or _current_week_id()
+        self._week_totals = {str(k): int(v or 0) for k, v in (wk.get("totals") or {}).items()}
+
+        # ✅ si cambió la semana desde la última vez que se abrió la app
+        self._weekly_rollover_if_needed()
+
+        self._build_ui()
+        self.refresh()
+        self._start_notifications_loop()
+        # =========================
+        # Usuario activo por defecto (filtro de tareas)
+        # =========================
+        if self.context.get("role") == "boss":
+            self.active_user_filter = self.context.get("user_id", "ALL")
+        else:
+            self.active_user_filter = self.context.get("user_id", "")
+
+    # -------------------------
+    # UI
+    #
+    #-------------------------
+    def _break_state_file(self) -> str:
+        return os.path.join(_get_appdata_base_dir(), "break_state.json")
+
+    def _save_break_state(self):
+        try:
+            payload = {
+                "running": bool(self.break_running),
+                "start_ts": float(self.break_start_ts or 0),
+                "elapsed": int(self.break_elapsed_sec or 0),
+                "saved_at": _iso_now(),
+            }
+            with open(self._break_state_file(), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    # =========================
+    # ✅ WEEK TOTALS (contador semanal aparte del histórico real)
+    # =========================
+    def _start_gcal_inbox_watcher(self):
+        if getattr(self, "_gcal_watcher", None):
+            return
+        self._gcal_watcher = _GCalInboxWatcher(self, poll_sec=3.0)
+        self._gcal_watcher.start()
+
+    def destroy(self):
+        # si tu app destruye este frame, apagamos el watcher
+        try:
+            if getattr(self, "_gcal_watcher", None):
+                self._gcal_watcher.stop()
+        except Exception:
+            pass
+        return super().destroy()
+
+    def _load_week_totals(self) -> Dict[str, Any]:
+        """
+        Devuelve:
+          {
+            "week_id": "2026-W05",
+            "totals": {"task_id": seconds, ...}
+          }
+        """
+        try:
+            p = _week_totals_file()
+            if not os.path.exists(p):
+                return {"week_id": _current_week_id(), "totals": {}}
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f) or {}
+            if not isinstance(d, dict):
+                return {"week_id": _current_week_id(), "totals": {}}
+            d.setdefault("week_id", _current_week_id())
+            d.setdefault("totals", {})
+            if not isinstance(d["totals"], dict):
+                d["totals"] = {}
+            return d
+        except Exception:
+            return {"week_id": _current_week_id(), "totals": {}}
+
+    def _save_week_totals(self):
+        try:
+            payload = {"week_id": self._week_id, "totals": self._week_totals}
+            with open(_week_totals_file(), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _archive_week_totals(self, week_id: str, totals: Dict[str, int]):
+        """
+        Guarda un snapshot semanal (opcional pero útil).
+        """
+        try:
+            entry = {
+                "saved_at": _iso_now(),
+                "week_id": week_id,
+                "totals": totals,
+            }
+            with open(_week_totals_archive_file(), "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    def import_google_calendar_week(self, raw_text: str, assignee: Optional[str] = None) -> int:
+        """
+        Crea/actualiza tareas desde un texto de semana de Google Calendar.
+        - No duplica: usa (source, source_id) como clave
+        - scheduled_for y due_at = fecha del evento
+        Devuelve cantidad de tareas creadas.
+        """
+        actor = self.context.get("user_id", "")
+        me = self.context.get("user_id", "")
+        target_assignee = (assignee or "").strip() or me
+
+        items = _parse_gcal_week_text(raw_text)
+        if not items:
+            return 0
+
+        created = 0
+        changed = 0
+
+        # índice rápido de existentes por (source, source_id)
+        existing_by_key: Dict[Tuple[str, str], Task] = {}
+        for t in self.store.list_tasks():
+            if (t.source or "") and (t.source_id or ""):
+                existing_by_key[(t.source, t.source_id)] = t
+
+        for day_iso, event_id in items:
+            key = (GCAL_SOURCE, event_id)
+            t = existing_by_key.get(key)
+
+            title = f"Google Calendar • {event_id}"
+            desc = "Importado desde Google Calendar"
+            tags = ["google_calendar"]
+
+            if t:
+                # actualizar (por si cambia fecha o lo asignás a otro)
+                prev_day = t.scheduled_for or ""
+                t.title = t.title or title
+                t.description = t.description or desc
+                t.tags = sorted(set((t.tags or []) + tags))
+                t.source = GCAL_SOURCE
+                t.source_id = event_id
+                t.scheduled_for = day_iso
+                t.due_at = day_iso
+                if target_assignee:
+                    t.assignee = target_assignee
+
+                try:
+                    self.api.update_task(self.context, t)
+                    changed += 1
+                    _event(actor, t.task_id, "GCAL_TASK_UPDATED", {"event_id": event_id, "from": prev_day, "to": day_iso})
+                except Exception:
+                    pass
+                continue
+
+            # crear nueva
+            now = _iso_now()
+            new_task = Task(
+                task_id=str(uuid.uuid4()),
+                title=title,
+                description=desc,
+                expediente_id=event_id,          # para pasar tu validación actual (expediente obligatorio)
+                tags=tags,
+                task_type="Empresa",
+                priority="Media",
+                color="#3498db",                 # azul (podés cambiar)
+                work_type="Operativo",
+                created_at=now,
+                scheduled_for=day_iso,
+                due_at=day_iso,
+                owner=me,
+                assignee=target_assignee,
+                status="NEW",
+            )
+            new_task.source = GCAL_SOURCE
+            new_task.source_id = event_id
+            new_task.source_meta = {}
+
+            try:
+                self.api.create_task(self.context, new_task)
+                created += 1
+                _event(actor, new_task.task_id, "GCAL_TASK_CREATED", {"event_id": event_id, "day": day_iso})
+            except Exception:
+                pass
+
+        if created or changed:
+            self.refresh()
+
+        return created
+
+    def _weekly_rollover_if_needed(self):
+        """
+        ✅ Si cambió la semana:
+        - archiva week_totals anterior
+        - resetea week_totals a {}
+        - resetea descanso semanal (break) a 0 (y archiva si querés)
+        """
+        now_week = _current_week_id()
+        if getattr(self, "_week_id", None) == now_week:
+            return
+
+        prev_week = getattr(self, "_week_id", None)
+        prev_totals = getattr(self, "_week_totals", {}) or {}
+
+        # archive + reset week totals
+        if prev_week:
+            self._archive_week_totals(prev_week, prev_totals)
+        self._week_id = now_week
+        self._week_totals = {}
+        self._save_week_totals()
+
+        # ✅ reset descanso semanal
+        try:
+            self.break_running = False
+            self.break_start_ts = 0.0
+            self.break_elapsed_sec = 0
+            self._save_break_state()
+            # refresca label si existe
+            if hasattr(self, "lbl_break"):
+                self.lbl_break.configure(text=_fmt_sec(0))
+        except Exception:
+            pass
+
+        # opcional: reset anti-spam de recordatorios EOD
+        try:
+            self._eod_notif_sent = {}
+        except Exception:
+            pass
+
+    def _load_break_state(self):
+        try:
+            path = self._break_state_file()
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f) or {}
+            self.break_running = bool(d.get("running", False))
+            self.break_start_ts = float(d.get("start_ts", 0.0))
+            self.break_elapsed_sec = int(d.get("elapsed", 0))
+            # Si estaba corriendo y se cerró, lo dejamos en pausado pero con el elapsed guardado
+            if self.break_running:
+                self.break_running = False
+        except Exception:
+            pass
+
+    def _nav_step(self, delta: int):
+        """
+        delta = -1 (atrás) / +1 (adelante)
+        DAY: +/- 1 día
+        WEEK: +/- 7 días
+        MONTH: +/- 1 mes
+        """
+        mode = getattr(self, "view_mode", "WEEK")
+
+        if mode in ("DAY",):
+            self.selected_day = (self.selected_day or date.today()) + timedelta(days=delta)
+            self._render_agenda()
+            return
+
+        if mode in ("WEEK", "TODAY"):
+            self.selected_day = (self.selected_day or date.today()) + timedelta(days=7 * delta)
+            self._render_agenda()
+            return
+
+        # MONTH
+        self._shift_month(delta)
+
+    def _nav_today(self):
+        """
+        ✅ Ir a HOY sin forzar WEEK.
+        - Si estás en MONTH, te posiciona el mes en curso.
+        - Si estás en WEEK o DAY, sólo cambia selected_day.
+        """
+        self.selected_day = date.today()
+        if getattr(self, "view_mode", "WEEK") == "MONTH":
+            self.view_month = date.today().replace(day=1)
+        self._render_agenda()
+    def _tick_eod_reminders(self):
+        ws = getattr(self, "work_settings", None) or _load_work_settings()
+
+        # si hoy no es laborable => no molestar
+        wd = date.today().weekday()  # 0..6
+        if wd not in set(ws.get("work_days", DEFAULT_WORK_SETTINGS["work_days"])):
+            return
+
+        end_min = _minutes_from_hhmm(ws.get("end_time", "18:00"))
+        if end_min is None:
+            return
+
+        now_min = _minutes_now()
+        left = end_min - now_min
+        if left <= 0:
+            return
+
+        # thresholds por prioridad (en minutos antes de fin de jornada)
+        # ✅ urgentes: 120, 60, 30, 15
+        prio_map = {
+            "Baja":   [35],
+            "Media":  [60],
+            "Alta":   [90, 60, 45],
+            "Urgente":[120, 60, 30, 15],
+        }
+
+        today_iso = _today_str()
+
+        # elegimos 1 sola notificación por tick para evitar spam/dobles
+        candidate = None  # (task, threshold)
+
+        for t in self.filtered_tasks:
+            if not t or t.status == "DONE":
+                continue
+
+            # solo recordamos si vence hoy o ya está vencida
+            due = (t.due_at or "").strip()
+            if not due:
+                continue
+            if due > today_iso:
+                continue
+
+            ths = prio_map.get(t.priority or "Media", [60])
+            for th in ths:
+                # dispara si estamos dentro de ventana [th .. th-1] aprox
+                if left <= th and left >= (th - 2):
+                    key = f"{t.task_id}:{th}"
+                    if self._eod_notif_sent.get(key) == today_iso:
+                        continue
+                    candidate = (t, th)
+                    break
+            if candidate:
+                break
+
+        if not candidate:
+            return
+
+        t, th = candidate
+        self._eod_notif_sent[f"{t.task_id}:{th}"] = today_iso
+
+        self._notify(
+            "Fin de jornada",
+            f"Tarea: {t.title}\nPrioridad: {t.priority}\nVence: {t.due_at}\n"
+            f"Quedan ~{left} min para terminar el día laboral."
+        )
+        _event(self.context.get("user_id", ""), t.task_id, "EOD_REMINDER", {"threshold_min": th, "left_min": left})
+
+    def _order_users_for_boss(self, users: list[str]) -> list[str]:
+        """
+        Orden:
+        1) Jefe
+        2) ALL
+        3) Resto de usuarios (ordenados)
+        """
+        me = self.context.get("user_id", "")
+
+        clean = [u for u in users if u and u != me and u != "ALL"]
+        clean = sorted(set(clean))
+
+        ordered = []
+        if me:
+            ordered.append(me)
+        ordered.append("ALL")
+        ordered.extend(clean)
+
+        return ordered
+
+    def _build_ui(self):
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=(10, 6))
+
+        ctk.CTkLabel(top, text="🗓️ Tareas", font=("Roboto", 16, "bold"), text_color=self.theme["TURQ"])\
+            .pack(side="left")
+
+        self.user_picker = None
+        if self.context.get("role") == "boss":
+            users = self._get_users_for_picker()
+            self.user_picker = ctk.CTkOptionMenu(
+                top, values=users, fg_color=self.theme["CARD2"], button_color=self.theme["CARD2"],
+                command=self._on_pick_user
+            )
+            me = (self.context.get("user_id") or "").strip()
+
+            # default: yo primero si existe; si no, ALL; si no, primero de la lista
+            if me and me in users:
+                default = me
+            elif "ALL" in users:
+                default = "ALL"
+            else:
+                default = users[0] if users else "ALL"
+
+            self.selected_user_filter = default
+            self.user_picker.set(default)
+
+            self.user_picker.pack(side="left", padx=(12, 0))
+
+        btns = ctk.CTkFrame(top, fg_color="transparent")
+        btns.pack(side="right")
+        ctk.CTkButton(
+            btns, text="⏸ Descanso", fg_color="#22324a", hover_color="#2b3e5b",
+            width=130, command=self._open_break_popup
+        ).pack(side="right", padx=(8, 0))
+
+        ctk.CTkButton(btns, text="+ Nueva", fg_color=self.theme["TURQ"], text_color="#001013",
+                      hover_color="#12b5aa", width=110, command=self._new_task)\
+            .pack(side="right", padx=(8, 0))
+
+        ctk.CTkButton(btns, text="Refrescar", fg_color="#22324a", hover_color="#2b3e5b",
+                      width=110, command=self.refresh)\
+            .pack(side="right")
+        ctk.CTkButton(
+            btns, text="Personalizar", fg_color="#22324a", hover_color="#2b3e5b",
+            width=130, command=self._open_work_settings
+        ).pack(side="right", padx=(8, 0))
+
+        self.tabs = ctk.CTkTabview(self, fg_color="transparent")
+        self.tabs.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.tab_agenda = self.tabs.add("Agenda")
+        self.tab_lista = self.tabs.add("Lista")
+        self.tab_timer = self.tabs.add("Timer")
+
+        self._build_agenda()
+        self._build_lista()
+        self._build_timer()
+
+    def _get_users_for_picker(self) -> List[str]:
+        if self.on_request_user_list:
+            try:
+                u = self.on_request_user_list() or []
+                if "ALL" not in u:
+                    return ["ALL"] + u
+                return u
+            except Exception:
+                pass
+
+        users = sorted({t.assignee for t in self.store.list_tasks() if t.assignee})
+        return ["ALL"] + users if "ALL" not in users else users
+
+    def _on_pick_user(self, val: str):
+        self.selected_user_filter = val or "ALL"
+        self.refresh()
+
+    # -------------------------
+    # Data refresh
+    # -------------------------
+    def refresh(self):
+        ctx = dict(self.context)
+        if ctx.get("role") == "boss":
+            if self.selected_user_filter == "ALL":
+                ctx["visible_users"] = ["ALL"]
+            else:
+                ctx["visible_users"] = [self.selected_user_filter]
+
+        try:
+            self.tasks = self.api.fetch_tasks(ctx)
+        except Exception:
+            self.tasks = []
+
+        # ✅ 1) aplicar rollover de vencidas ANTES de filtrar/render
+        # ✅ rollover semanal (por si quedó abierta la app y cambió la semana)
+        try:
+            self._weekly_rollover_if_needed()
+        except Exception:
+            pass
+
+        try:
+            self._rollover_overdue_tasks()
+        except Exception:
+            pass
+
+        # ✅ 2) refetch opcional (para reflejar cambios si tu API es server real)
+        # Si usás LocalAPI, no hace falta; si es server, mejor refrescar:
+        try:
+            self.tasks = self.api.fetch_tasks(ctx)
+        except Exception:
+            pass
+
+        self.filtered_tasks = self._apply_visibility(self.tasks, ctx)
+        self._render_agenda()
+        self._render_lista()
+        self._render_timer_summary()
+
+        if self.user_picker and self.context.get("role") == "boss":
+            users = self._get_users_for_picker()
+            me = (self.context.get("user_id") or "").strip()
+            try:
+                self.user_picker.configure(values=users)
+
+                if self.selected_user_filter not in users:
+                    if me and me in users:
+                        self.selected_user_filter = me
+                        self.user_picker.set(me)
+                    elif "ALL" in users:
+                        self.selected_user_filter = "ALL"
+                        self.user_picker.set("ALL")
+                    else:
+                        self.selected_user_filter = users[0] if users else "ALL"
+                        self.user_picker.set(self.selected_user_filter)
+            except Exception:
+                pass
+
+    def _apply_visibility(self, tasks: List[Task], ctx: Dict[str, Any]) -> List[Task]:
+        role = ctx.get("role", "employee")
+        me = ctx.get("user_id", "")
+        visible = ctx.get("visible_users", [me])
+        if role == "boss":
+            if "ALL" in visible:
+                return tasks[:]
+            return [t for t in tasks if t.assignee in visible]
+        return [t for t in tasks if t.assignee == me]
+
+    # -------------------------
+    # Create/Edit task
+    # -------------------------
+    def _new_task(self):
+        users = self._get_users_for_editor()
+
+        # ✅ Clonamos el context para no ensuciar self.context global
+        ctx = dict(self.context)
+
+        # ✅ Si soy boss y estoy filtrando por un usuario específico,
+        # ese usuario tiene que ser el assignee por defecto en el editor.
+        if ctx.get("role") == "boss":
+            target = getattr(self, "selected_user_filter", "") or ""
+            if target and target != "ALL" and target in users:
+                ctx["default_assignee"] = target
+
+        TaskEditor(self, self.theme, ctx, users, None, self._save_task)
+
+    def _edit_task(self, t: Task):
+        users = self._get_users_for_editor()
+        TaskEditor(self, self.theme, self.context, users, t, self._save_task)
+
+    def _get_users_for_editor(self) -> List[str]:
+        if self.context.get("role") == "boss":
+            u = self._get_users_for_picker()
+            u2 = [x for x in u if x != "ALL"]
+            return u2 or [self.context.get("user_id", "")]
+        return [self.context.get("user_id", "")]
+
+    def _save_task(self, t: Task):
+        actor = self.context.get("user_id", "")
+        is_new = t.task_id not in self.store.tasks
+        try:
+            if is_new:
+                self.api.create_task(self.context, t)
+                _event(actor, t.task_id, "TASK_CREATED", {"title": t.title, "assignee": t.assignee})
+            else:
+                self.api.update_task(self.context, t)
+                _event(actor, t.task_id, "TASK_EDITED", {"title": t.title})
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo guardar la tarea: {e}")
+            return
+        # ✅ si tiene repetición, generamos copias (simple: crea tasks reales futuras)
+        try:
+            if getattr(t, "repeat_enabled", False) and (t.repeat_kind or "NONE") != "NONE":
+                self._generate_recurrences(t)
+        except Exception:
+            pass
+
+        self.refresh()
+    def _generate_recurrences(self, base: Task):
+        # Evita duplicar si ya es una copia
+        if getattr(base, "parent_task_id", ""):
+            return
+
+        kind = (base.repeat_kind or "NONE")
+        if kind == "NONE":
+            return
+
+        start_day = date.fromisoformat(base.scheduled_for or _today_str())
+
+        def _clone_for_day(dd: date) -> Task:
+            nt = Task(**asdict(base))
+            nt.task_id = str(uuid.uuid4())
+            nt.parent_task_id = base.task_id
+            nt.scheduled_for = dd.isoformat()
+            nt.status = "NEW"
+            nt.completed_at = ""
+            nt.time_total_sec = 0
+            nt.time_entries = []
+            # si tiene repeat_time, lo ponemos como scheduled_time
+            if base.repeat_time:
+                nt.scheduled_time = base.repeat_time
+            return nt
+
+        created = 0
+
+        if kind == "WEEKLY":
+            weeks = int(base.repeat_weeks or 0)
+            if weeks <= 0:
+                return
+            days = set(base.repeat_days or [])
+            for w in range(1, weeks + 1):
+                week_base = start_day + timedelta(days=7 * w)
+                # buscamos lunes de esa semana para ubicar días
+                ws = week_base - timedelta(days=(week_base.weekday() % 7))
+                for i in range(7):
+                    dd = ws + timedelta(days=i)
+                    if dd.weekday() in days:
+                        nt = _clone_for_day(dd)
+                        self.store.upsert(nt)
+                        created += 1
+
+        elif kind == "MONTHLY":
+            count = int(base.repeat_count or 0)
+            if count <= 0:
+                return
+            y, m, d = start_day.year, start_day.month, start_day.day
+            for k in range(1, count + 1):
+                mm = m + k
+                yy = y + (mm - 1) // 12
+                mm = ((mm - 1) % 12) + 1
+                # clamp día
+                try:
+                    dd = date(yy, mm, d)
+                except Exception:
+                    # si no existe (ej 31), bajamos hasta que exista
+                    for dd_day in range(28, 0, -1):
+                        try:
+                            dd = date(yy, mm, dd_day)
+                            break
+                        except Exception:
+                            continue
+                nt = _clone_for_day(dd)
+                self.store.upsert(nt)
+                created += 1
+
+        elif kind == "YEARLY":
+            count = int(base.repeat_count or 0)
+            if count <= 0:
+                return
+            y, m, d = start_day.year, start_day.month, start_day.day
+            for k in range(1, count + 1):
+                yy = y + k
+                try:
+                    dd = date(yy, m, d)
+                except Exception:
+                    dd = date(yy, m, 28)
+                nt = _clone_for_day(dd)
+                self.store.upsert(nt)
+                created += 1
+
+        if created:
+            _event(self.context.get("user_id", ""), base.task_id, "RECURRENCES_CREATED", {"count": created})
+
+    # =========================
+    # AGENDA (Calendario Mes + Drag)
+    # =========================
+    def _build_agenda(self):
+        root = ctk.CTkFrame(self.tab_agenda, fg_color="transparent")
+        root.pack(fill="both", expand=True)
+
+        top = ctk.CTkFrame(root, fg_color="transparent")
+        top.pack(fill="x", padx=6, pady=(6, 4))
+
+        self.lbl_month = ctk.CTkLabel(top, text="", font=("Roboto", 14, "bold"))
+        self.lbl_month.pack(side="left")
+
+        nav = ctk.CTkFrame(top, fg_color="transparent")
+        nav.pack(side="right")
+        # ✅ botones de vista (Día / Hoy / Semana / Mes)
+        # ✅ botones de vista (Hoy / Semana / Mes)
+        viewbar = ctk.CTkFrame(root, fg_color="transparent")
+        viewbar.pack(fill="x", padx=6, pady=(0, 6))
+
+        def _set_view(mode: str):
+            # ✅ "Hoy" va a hoy sin cambiarte a WEEK
+            if mode == "TODAY":
+                # ✅ Este botón debe mostrar SOLO el día de hoy
+                self.selected_day = date.today()
+                self.view_mode = "DAY"
+                self._render_agenda()
+                return
+
+            self.view_mode = mode
+            if mode == "MONTH":
+                self.view_month = (self.selected_day or date.today()).replace(day=1)
+            self._render_agenda()
+
+        self.btn_view_today = ctk.CTkButton(
+            viewbar, text="Hoy", width=70,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=lambda: _set_view("TODAY")
+        )
+        self.btn_view_today.pack(side="left", padx=(0, 6))
+
+        self.btn_view_week = ctk.CTkButton(
+            viewbar, text="1 Semana", width=90,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=lambda: _set_view("WEEK")
+        )
+        self.btn_view_week.pack(side="left", padx=6)
+
+        self.btn_view_month = ctk.CTkButton(
+            viewbar, text="Mes", width=70,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=lambda: _set_view("MONTH")
+        )
+        self.btn_view_month.pack(side="left", padx=6)
+
+        ctk.CTkButton(nav, text="◀", width=44, fg_color="#22324a", hover_color="#2b3e5b",
+                      command=lambda: self._nav_step(-1)).pack(side="left", padx=4)
+
+        ctk.CTkButton(nav, text="Siguiente", width=70, fg_color="#22324a", hover_color="#2b3e5b",
+                      command=self._nav_today).pack(side="left", padx=4)
+
+        ctk.CTkButton(nav, text="▶", width=44, fg_color="#22324a", hover_color="#2b3e5b",
+                      command=lambda: self._nav_step(+1)).pack(side="left", padx=4)
+
+        self.cal_wrap = ctk.CTkScrollableFrame(root, fg_color="transparent")
+        self.cal_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        self.view_month = date.today().replace(day=1)
+
+        # ✅ vista agenda
+        self.view_mode = "WEEK"
+  # "DAY" | "TODAY" | "WEEK" | "MONTH"
+        self.selected_day = date.today()  # para "DAY" y "WEEK"
+        self._task_chip_widgets = {}  # task_id -> chip widget (para mover sin re-render total)
+
+        # ✅ drag state robusto
+        self._dragging_task_id = None
+        self._drag_float = None
+        self._drag_bindids = {}  # para unbind limpio
+        self._day_targets = {}  # day_key -> cell drop target
+
+    def _go_today(self):
+        self.view_month = date.today().replace(day=1)
+        self._render_agenda()
+
+    def _shift_month(self, delta: int):
+        y = self.view_month.year
+        m = self.view_month.month + delta
+        while m < 1:
+            m += 12
+            y -= 1
+        while m > 12:
+            m -= 12
+            y += 1
+        self.view_month = date(y, m, 1)
+        self._render_agenda()
+
+    def _render_agenda(self):
+        for w in self.cal_wrap.winfo_children():
+            w.destroy()
+
+        mode = getattr(self, "view_mode", "WEEK")
+        today = date.today()
+
+        # ✅ label superior: usa mes del selected_day si estás en WEEK/DAY, si no del view_month
+        base_for_label = self.view_month
+        if mode in ("WEEK", "DAY", "TODAY"):
+            base_for_label = (self.selected_day or today).replace(day=1)
+        self.lbl_month.configure(text=_month_label_es(base_for_label))
+
+        # =========================
+        # determinar rango según vista
+        # =========================
+        if mode == "DAY":
+            days = [self.selected_day or today]
+            rows, cols = 1, 1
+        elif mode in ("WEEK", "TODAY"):
+            base = self.selected_day or today
+            week_start = base - timedelta(days=(base.weekday() % 7))  # lunes
+            days = [week_start + timedelta(days=i) for i in range(7)]
+            rows, cols = 1, 7
+        else:
+            # MONTH
+            first = self.view_month
+            start = first - timedelta(days=(first.weekday() % 7))  # lunes
+            days = [start + timedelta(days=i) for i in range(42)]
+            rows, cols = 6, 7
+
+        # =========================
+        # header alineado (grid)
+        # =========================
+        header = ctk.CTkFrame(self.cal_wrap, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 6))
+
+        day_names = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+
+        if cols == 7:
+            for i, dname in enumerate(day_names):
+                lbl = ctk.CTkLabel(header, text=dname, text_color=self.theme["MUTED"])
+                lbl.grid(row=0, column=i, sticky="nsew", padx=4)
+                header.grid_columnconfigure(i, weight=1, uniform="daycol")
+        else:
+            lbl = ctk.CTkLabel(header, text=day_names[(days[0].weekday())], text_color=self.theme["MUTED"])
+            lbl.grid(row=0, column=0, sticky="nsew", padx=4)
+            header.grid_columnconfigure(0, weight=1)
+
+        # reset targets/cells
+        self._day_cells = {}
+        self._day_targets = {}
+        self._task_chip_widgets = {}
+
+        # =========================
+        # grilla
+        # =========================
+        idx = 0
+        for r_i in range(rows):
+            rowf = ctk.CTkFrame(self.cal_wrap, fg_color="transparent", height=WEEK_ROW_H)
+            rowf.pack(fill="x")
+            rowf.pack_propagate(False)
+
+            if cols == 7:
+                for c_i in range(7):
+                    rowf.grid_columnconfigure(c_i, weight=1, uniform="daycol")
+            else:
+                rowf.grid_columnconfigure(0, weight=1)
+
+            for c_i in range(cols):
+                day = days[idx]
+                idx += 1
+                day_key = day.isoformat()
+
+                # ✅ color base + resaltado HOY
+                is_current_month = True
+                if mode == "MONTH":
+                    is_current_month = (day.month == self.view_month.month)
+
+                base_cell = self.theme["CARD"]
+                if mode in ("WEEK", "MONTH") and day == today:
+                    base_cell = "#1b3552"  # ✅ resaltado HOY (podés cambiarlo)
+                elif mode == "MONTH" and not is_current_month:
+                    base_cell = self.theme["CARD2"]
+
+                cell = ctk.CTkFrame(rowf, fg_color=base_cell, corner_radius=14)
+                cell.grid(row=0, column=c_i, sticky="nsew", padx=4, pady=4)
+
+                top = ctk.CTkFrame(cell, fg_color="transparent", height=DAY_HEADER_H)
+                top.pack(fill="x", padx=8, pady=(6, 2))
+                top.pack_propagate(False)
+
+                num_color = self.theme["WHITE"] if is_current_month else self.theme["MUTED"]
+                day_lbl = ctk.CTkLabel(top, text=str(day.day), text_color=num_color, font=("Roboto", 12, "bold"))
+                day_lbl.pack(side="left")
+
+                # ✅ clic en número => abre DAY
+                def _pick_day(_e, dd=day):
+                    self.selected_day = dd
+                    self.view_mode = "DAY"
+                    self._render_agenda()
+
+                day_lbl.bind("<Button-1>", _pick_day)
+
+                box = ctk.CTkScrollableFrame(cell, fg_color="transparent")
+                box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+                self._day_cells[day_key] = box
+                self._day_targets[day_key] = cell
+
+        # poblar chips
+        # ✅ ordenar por hora dentro del día
+        by_day: Dict[str, List[Task]] = {}
+        for t in self.filtered_tasks:
+            if not t.scheduled_for:
+                continue
+            by_day.setdefault(t.scheduled_for, []).append(t)
+
+        def _sort_key(tt: Task):
+            hhmm = (tt.scheduled_time or tt.repeat_time or "").strip()
+            m = _minutes_from_hhmm(hhmm)
+            return (m if m is not None else 999999, (tt.priority or ""), (tt.title or ""))
+
+        for day_key, arr in by_day.items():
+            if day_key not in self._day_cells:
+                continue
+            for t in sorted(arr, key=_sort_key):
+                self._add_task_chip(self._day_cells[day_key], t)
+
+    def _add_task_chip(self, parent, t: Task):
+        is_done = (t.status == "DONE")
+
+        chip = ctk.CTkFrame(
+            parent,
+            fg_color=(self.theme["CARD2"] if not is_done else "#0f1726"),
+            corner_radius=12,
+            border_width=(2 if is_done else 0),
+            border_color=(self.theme["OK"] if is_done else None)
+        )
+        chip.pack(fill="x", pady=4, padx=2)
+
+        self._task_chip_widgets[t.task_id] = chip
+
+        # --- fila título
+        top = ctk.CTkFrame(chip, fg_color="transparent")
+        top.pack(fill="x", padx=8, pady=(6, 2))
+        dot_color = (t.color or self.theme["TURQ"])
+        if is_done:
+            dot_color = self.theme["OK"]
+        dot = ctk.CTkFrame(top, fg_color=dot_color, width=8, height=8, corner_radius=4)
+
+
+        dot.pack(side="left", padx=(0, 6))
+        dot.pack_propagate(False)
+
+        label_txt = t.title
+        if (t.source or "") == "google_calendar":
+            label_txt = "📅 " + label_txt
+        if t.expediente_id:
+            label_txt = f"{label_txt} • {t.expediente_id}"
+
+        lbl_color = (self.theme["WHITE"] if not is_done else self.theme["MUTED"])
+        lbl = ctk.CTkLabel(
+            top,
+            text=label_txt,
+            anchor="w",
+            justify="left",
+            wraplength=220,
+            font=("Roboto", 11),
+            text_color=lbl_color
+        )
+        lbl.pack(side="left", fill="x", expand=True)
+
+        # --- fila acciones abajo
+        actions = ctk.CTkFrame(chip, fg_color="transparent")
+        actions.pack(fill="x", padx=8, pady=(2, 6))
+
+        running_this = bool(self.timer_running and self.timer_task_id == t.task_id)
+
+        # ✅ Play/Pause
+        btn_play = ctk.CTkButton(
+            actions,
+            text=("⏸" if running_this else "▶"),
+            width=42,
+            fg_color="#22324a",
+            hover_color="#2b3e5b",
+            command=(lambda tt=t: self._pause_timer() if running_this else self._start_timer_for(tt))
+        )
+        btn_play.pack(side="left", padx=(0, 6))
+
+        # ✅ Timer visible en el chip
+        # Si está corriendo, mostramos mm:ss; si no, mostramos total acumulado
+        # ✅ muestra total de ESTA SEMANA (no el acumulado histórico)
+        week_sec = int(getattr(self, "_week_totals", {}).get(t.task_id, 0) or 0)
+        show_txt = _fmt_sec(week_sec)
+
+        if running_this:
+            # se actualizará con _tick_timer
+            show_txt = "00:00"
+
+        lbl_time = ctk.CTkLabel(actions, text=show_txt, text_color=self.theme["MUTED"])
+        lbl_time.pack(side="left", padx=(0, 10))
+        self._chip_timer_labels[t.task_id] = lbl_time
+
+        # ✅ Manual como CHECKBOX (sin botón)
+        v = tk.IntVar(value=0)
+        cb = ctk.CTkCheckBox(
+            actions,
+            text="Manual",
+            variable=v,
+            onvalue=1,
+            offvalue=0,
+            command=lambda tt=t, vv=v: self._manual_checkbox_flow(tt, vv)
+        )
+        cb.pack(side="left")
+
+        # editar con doble click
+        lbl.bind("<Double-Button-1>", lambda _e, tt=t: self._edit_task(tt))
+        chip.bind("<Double-Button-1>", lambda _e, tt=t: self._edit_task(tt))
+
+        # drag
+        def start_drag(e, task_id=t.task_id):
+            self._start_drag(task_id, e)
+
+        chip.bind("<Button-1>", start_drag)
+        lbl.bind("<Button-1>", start_drag)
+
+    # ✅ DRAG robusto (bind global)
+    def _start_drag(self, task_id: str, event):
+        self._dragging_task_id = task_id
+
+        if self._drag_float:
+            try:
+                self._drag_float.destroy()
+            except Exception:
+                pass
+
+        self._drag_float = tk.Toplevel(self.winfo_toplevel())
+        self._drag_float.overrideredirect(True)
+        self._drag_float.attributes("-topmost", True)
+        self._drag_float.configure(bg=self.theme["NAVY"])
+
+        t = self._get_task(task_id)
+        txt = t.title if t else "Tarea"
+        lab = tk.Label(self._drag_float, text=txt, bg=self.theme["NAVY"], fg=self.theme["WHITE"], padx=10, pady=6)
+        lab.pack()
+
+        top = self.winfo_toplevel()
+        try:
+            self._drag_bindids["motion"] = top.bind("<B1-Motion>", self._move_drag, add="+")
+            self._drag_bindids["release"] = top.bind("<ButtonRelease-1>", self._end_drag, add="+")
+        except Exception:
+            pass
+
+        self._move_drag(event)
+
+    def _move_drag(self, event=None):
+        if not self._drag_float:
+            return
+        try:
+            x = self.winfo_pointerx() + 12
+            y = self.winfo_pointery() + 12
+            self._drag_float.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+    def _manual_checkbox_flow(self, t: Task, var: tk.IntVar):
+        # ✅ se comporta como acción (no queda tildado)
+        try:
+            var.set(0)
+        except Exception:
+            pass
+
+        if not t:
+            return
+
+        cur_sec = int(t.time_total_sec or 0)
+
+        # Caso 1: tiempo 0 -> obligatorio ingresar tiempo
+        if cur_sec <= 0:
+            win = ctk.CTkInputDialog(text="Esta tarea tiene 0 tiempo.\nIngresá minutos (obligatorio):",
+                                     title="Tiempo manual")
+            val = (win.get_input() or "").strip()
+            try:
+                mins = int(val)
+                if mins <= 0:
+                    raise ValueError
+            except Exception:
+                messagebox.showerror("Error", "Minutos inválidos.")
+                return
+
+            new_total_sec = mins * 60
+            delta = new_total_sec - cur_sec
+            self._apply_manual_total_adjust(t, delta, new_total_sec)
+            return
+
+        # Caso 2: tiempo > 0 -> confirmar si está conforme
+        ok = messagebox.askyesno(
+            "Tiempo manual",
+            f"Esta tarea ya tiene {_fmt_sec(cur_sec)}.\n¿Estás conforme con ese tiempo?"
+        )
+        if ok:
+            _event(self.context.get("user_id", ""), t.task_id, "MANUAL_TIME_CONFIRMED", {"current_total_sec": cur_sec})
+            return
+
+        win = ctk.CTkInputDialog(text="Ingresá el TOTAL nuevo en minutos:", title="Cambiar tiempo total")
+        val = (win.get_input() or "").strip()
+        try:
+            mins = int(val)
+            if mins < 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Error", "Minutos inválidos.")
+            return
+
+        new_total_sec = mins * 60
+        delta = new_total_sec - cur_sec
+        if delta == 0:
+            _event(self.context.get("user_id", ""), t.task_id, "MANUAL_TIME_NOCHANGE", {"total_sec": cur_sec})
+            return
+
+        self._apply_manual_total_adjust(t, delta, new_total_sec)
+
+    def _apply_manual_total_adjust(self, t: Task, delta_sec: int, new_total_sec: int):
+        """
+        Ajusta el total usando un TimeEntry MANUAL con delta (puede ser negativo).
+        Queda registrado en events.jsonl y también en time_entries.
+        """
+        entry = TimeEntry(
+            mode="MANUAL",
+            actor=self.context.get("user_id", ""),
+            start_at="",
+            stop_at=_iso_now(),
+            duration_sec=int(delta_sec),
+            note=f"adjust_total_to={new_total_sec}"
+        )
+
+        _event(self.context.get("user_id", ""), t.task_id, "MANUAL_TIME_ADJUST_REQUEST", {
+            "delta_sec": int(delta_sec),
+            "new_total_sec": int(new_total_sec),
+            "prev_total_sec": int(t.time_total_sec or 0),
+        })
+
+        self._add_time_entry(t.task_id, entry)
+
+    def _end_drag(self, event=None):
+        if not self._dragging_task_id:
+            return
+
+        try:
+            px = self.winfo_pointerx()
+            py = self.winfo_pointery()
+            dropped_day = None
+
+            for day_key, cell in (self._day_targets or {}).items():
+                try:
+                    bx = cell.winfo_rootx()
+                    by = cell.winfo_rooty()
+                    bw = cell.winfo_width()
+                    bh = cell.winfo_height()
+                    if bx <= px <= bx + bw and by <= py <= by + bh:
+                        dropped_day = day_key
+                        break
+                except Exception:
+                    continue
+
+            if dropped_day:
+                self._reschedule_task(self._dragging_task_id, dropped_day)
+
+        finally:
+            try:
+                top = self.winfo_toplevel()
+                mid = self._drag_bindids.get("motion")
+                rid = self._drag_bindids.get("release")
+                if mid:
+                    top.unbind("<B1-Motion>", mid)
+                if rid:
+                    top.unbind("<ButtonRelease-1>", rid)
+            except Exception:
+                pass
+            self._drag_bindids = {}
+
+            self._dragging_task_id = None
+            if self._drag_float:
+                try:
+                    self._drag_float.destroy()
+                except Exception:
+                    pass
+                self._drag_float = None
+
+    def _reschedule_task(self, task_id: str, new_day: str):
+        t = self._get_task(task_id)
+        if not t:
+            return
+        old_day = t.scheduled_for or ""
+        if old_day == new_day:
+            return
+
+        actor = self.context.get("user_id", "")
+
+        should_ask_due = bool(t.due_at)
+        can_edit_due = bool(self.context.get("can_edit_due")) or (self.context.get("role") == "boss")
+
+        move_due = False
+        if should_ask_due and can_edit_due:
+            try:
+                due_date = t.due_at[:10]
+                if due_date and due_date < new_day:
+                    move_due = messagebox.askyesno(
+                        "Vencimiento",
+                        "Esta tarea queda programada después del vencimiento.\n¿Querés mover el vencimiento también?"
+                    )
+            except Exception:
+                pass
+
+        t.scheduled_for = new_day
+        if move_due and t.due_at:
+            if "T" in t.due_at:
+                t.due_at = new_day + t.due_at[10:]
+            else:
+                t.due_at = new_day
+            _event(actor, t.task_id, "TASK_DUE_CHANGED", {"to": t.due_at})
+
+        try:
+            self.api.update_task(self.context, t)
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo reprogramar: {e}")
+            return
+
+        _event(actor, t.task_id, "TASK_RESCHEDULED", {"from_date": old_day, "to_date": new_day})
+
+        # ✅ SOLO mover chip (2 celdas) + refrescos livianos (lista/timer)
+        self._move_task_chip(task_id, old_day, new_day)
+        self._render_lista()
+        self._render_timer_summary()
+    # =========================
+    # ✅ OVERDUE ROLLOVER (vencidas -> hoy)
+    # =========================
+    def _overdue_rollover_file(self) -> str:
+        return os.path.join(_get_appdata_base_dir(), "overdue_rollover.json")
+
+    def _load_overdue_rollover_state(self) -> Dict[str, str]:
+        """
+        Guarda por task_id la última fecha (YYYY-MM-DD) en la que se hizo rollover,
+        para no repetirlo 20 veces por refresh.
+        """
+        try:
+            p = self._overdue_rollover_file()
+            if not os.path.exists(p):
+                return {}
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f) or {}
+            if isinstance(d, dict):
+                # task_id -> "YYYY-MM-DD"
+                return {str(k): str(v) for k, v in d.items()}
+            return {}
+        except Exception:
+            return {}
+
+    def _save_overdue_rollover_state(self, d: Dict[str, str]):
+        try:
+            with open(self._overdue_rollover_file(), "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _rollover_overdue_tasks(self):
+        """
+        ✅ Si una tarea está vencida (due < hoy) y no está DONE/CANCELLED:
+        - la pasa a HOY (scheduled_for y due_at)
+        - registra evento
+        - evita repetir en el mismo día por task_id
+        """
+        today_iso = _today_str()
+        state = self._load_overdue_rollover_state()
+        changed_any = False
+
+        for t in (self.tasks or []):
+            if not t:
+                continue
+
+            st = (t.status or "").strip().upper()
+            if st in ("DONE", "CANCELLED"):
+                continue
+
+            due_raw = (t.due_at or "").strip()
+            if not due_raw:
+                continue
+
+            due10 = due_raw[:10]  # normaliza (por si viene con hora)
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", due10):
+                continue
+
+            # si no está vencida, nada
+            if due10 >= today_iso:
+                continue
+
+            # si ya la rollee hoy, no repetir
+            if state.get(t.task_id) == today_iso:
+                continue
+
+            old_due = due10
+            old_sched = (t.scheduled_for or "")
+
+            # ✅ regla: vencida -> HOY
+            t.due_at = today_iso
+            t.scheduled_for = today_iso
+            if t.status == "DONE":
+                t.status = "NEW"
+
+            try:
+                self.api.update_task(self.context, t)
+            except Exception:
+                # si falla server/store, no marques state como hecho
+                continue
+
+            state[t.task_id] = today_iso
+            changed_any = True
+
+            _event(
+                self.context.get("user_id", ""),
+                t.task_id,
+                "TASK_OVERDUE_ROLLOVER",
+                {
+                    "from_due": old_due,
+                    "to_due": today_iso,
+                    "from_scheduled_for": old_sched,
+                    "to_scheduled_for": today_iso,
+                }
+            )
+
+        if changed_any:
+            self._save_overdue_rollover_state(state)
+
+    def _get_task(self, task_id: str) -> Optional[Task]:
+        for t in self.tasks:
+            if t.task_id == task_id:
+                return t
+        return self.store.tasks.get(task_id)
+
+    def _move_task_chip(self, task_id: str, old_day: str, new_day: str):
+        """
+        ✅ FIX: en vez de re-packear el mismo widget (a veces desaparece),
+        destruimos y recreamos el chip en el destino.
+        """
+        try:
+            # destruir chip viejo si existe
+            old_chip = self._task_chip_widgets.pop(task_id, None)
+            if old_chip:
+                try:
+                    old_chip.destroy()
+                except Exception:
+                    pass
+
+            # crear chip nuevo si el destino está visible en esta vista
+            t = self._get_task(task_id)
+            if t and new_day in self._day_cells:
+                self._add_task_chip(self._day_cells[new_day], t)
+
+        except Exception:
+            pass
+
+    def _delete_task(self, t: Task):
+        """
+        ✅ Borrar tarea (con confirmación).
+        Soporta LocalAPI; si luego enchufás server, podés implementar delete_task en tu API.
+        """
+        if not t:
+            return
+        ok = messagebox.askyesno("Borrar tarea", f"¿Seguro que querés borrar:\n\n{t.title}?")
+        if not ok:
+            return
+
+        try:
+            # si tu API futura tiene delete_task
+            if hasattr(self.api, "delete_task"):
+                self.api.delete_task(self.context, t.task_id)
+            else:
+                self.store.delete(t.task_id)
+
+            _event(self.context.get("user_id", ""), t.task_id, "TASK_DELETED", {"title": t.title})
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo borrar: {e}")
+            return
+
+        # limpiar chip si estaba
+        chip = self._task_chip_widgets.pop(t.task_id, None)
+        if chip:
+            try:
+                chip.destroy()
+            except Exception:
+                pass
+
+        self.refresh()
+
+    # =========================
+    # LISTA
+    # =========================
+    def _build_lista(self):
+        root = ctk.CTkFrame(self.tab_lista, fg_color="transparent")
+        root.pack(fill="both", expand=True)
+
+        top = ctk.CTkFrame(root, fg_color="transparent")
+        top.pack(fill="x", padx=6, pady=(6, 8))
+
+        self.search_entry = ctk.CTkEntry(top, placeholder_text="Buscar (título, expediente, tags)", fg_color=self.theme["CARD2"])
+        self.search_entry.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(top, text="Buscar", width=110, fg_color="#22324a", hover_color="#2b3e5b",
+                      command=self._render_lista).pack(side="left", padx=(8, 0))
+
+        self.list_wrap = ctk.CTkFrame(root, fg_color=self.theme["CARD"], corner_radius=16)
+        self.list_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+    def _render_lista(self):
+        for w in self.list_wrap.winfo_children():
+            w.destroy()
+
+        q = (self.search_entry.get().strip().lower() if hasattr(self, "search_entry") else "")
+        rows = []
+        for t in self.filtered_tasks:
+            blob = " ".join([
+                t.title or "", t.description or "", t.expediente_id or "",
+                " ".join(t.tags or []),
+                t.assignee or "", t.work_type or "", t.priority or "", t.status or ""
+            ]).lower()
+            if q and q not in blob:
+                continue
+            rows.append(t)
+
+        head = ctk.CTkFrame(self.list_wrap, fg_color="transparent")
+        head.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(head, text="Estado", text_color=self.theme["MUTED"], width=90).pack(side="left")
+        ctk.CTkLabel(head, text="Prioridad", text_color=self.theme["MUTED"], width=90).pack(side="left")
+        ctk.CTkLabel(head, text="Trabajo", text_color=self.theme["MUTED"], width=130).pack(side="left")
+        ctk.CTkLabel(head, text="Título", text_color=self.theme["MUTED"]).pack(side="left", expand=True, fill="x")
+        ctk.CTkLabel(head, text="Expediente", text_color=self.theme["MUTED"], width=120).pack(side="left")
+        ctk.CTkLabel(head, text="Hacer", text_color=self.theme["MUTED"], width=90).pack(side="left")
+
+        ctk.CTkLabel(head, text="", width=160).pack(side="right")
+
+        body = ctk.CTkScrollableFrame(self.list_wrap, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 10))
+
+        for t in sorted(rows, key=lambda x: (x.scheduled_for or "9999-99-99", PRIORITIES.index(x.priority) if x.priority in PRIORITIES else 9)):
+            row = ctk.CTkFrame(body, fg_color=self.theme["CARD2"], corner_radius=14)
+            row.pack(fill="x", pady=5, padx=6)
+
+            ctk.CTkLabel(row, text=t.status, width=90, text_color=self.theme["WHITE"]).pack(side="left", padx=(10, 0))
+            ctk.CTkLabel(row, text=t.priority, width=90, text_color=self.theme["WHITE"]).pack(side="left")
+            ctk.CTkLabel(row, text=t.work_type, width=130, text_color=self.theme["WHITE"]).pack(side="left")
+
+            title = t.title
+            if t.task_type == "Personal" and self.context.get("role") == "boss":
+                title = "🔒 Personal"
+            ctk.CTkLabel(row, text=title, anchor="w").pack(side="left", expand=True, fill="x", padx=8)
+
+            ctk.CTkLabel(row, text=(t.expediente_id or "—"), width=120, text_color=self.theme["MUTED"]).pack(side="left")
+            week_sec = int(getattr(self, "_week_totals", {}).get(t.task_id, 0) or 0)
+            ctk.CTkLabel(row, text=_fmt_sec(week_sec), width=90, text_color=self.theme["MUTED"]).pack(side="left")
+
+            actions = ctk.CTkFrame(row, fg_color="transparent")
+            actions.pack(side="right", padx=10)
+
+            running_this = bool(self.timer_running and self.timer_task_id == t.task_id)
+
+            ctk.CTkButton(
+                actions,
+                text="🗑",
+                width=36,
+                fg_color="#22324a",
+                hover_color="#2b3e5b",
+                command=lambda tt=t: self._delete_task(tt)
+            ).pack(side="left", padx=4)
+
+            # ✅ aparece si ya hay tiempo guardado
+            has_saved_time = int(t.time_total_sec or 0) > 0
+            if has_saved_time and t.status != "DONE":
+                ctk.CTkButton(
+                    actions, text="✅", width=40,
+                    fg_color="#22324a", hover_color="#2b3e5b",
+                    command=lambda tt=t: self._complete_task(tt)
+                ).pack(side="left", padx=4)
+
+            ctk.CTkButton(actions, text="Manual", width=64, fg_color="#22324a", hover_color="#2b3e5b",
+                          command=lambda tt=t: self._finish_manual(tt)).pack(side="left", padx=4)
+
+            ctk.CTkButton(actions, text="Editar", width=56, fg_color="#22324a", hover_color="#2b3e5b",
+                          command=lambda tt=t: self._edit_task(tt)).pack(side="left", padx=4)
+
+    def _bring_to_front(self):
+        try:
+            top = self.winfo_toplevel()
+            top.deiconify()
+            top.lift()
+            top.focus_force()
+        except Exception:
+            pass
+
+    def _notify(self, title: str, msg: str):
+        actor = self.context.get("user_id", "")
+        _event(actor, (self.timer_task_id or ""), "NOTIFICATION_SHOWN", {"title": title, "msg": msg})
+
+        # ✅ Popup interno tipo “toast” (sin win10toast)
+        try:
+            top = self.winfo_toplevel()
+
+            toast = ctk.CTkToplevel(top)
+            toast.overrideredirect(True)
+            toast.attributes("-topmost", True)
+            toast.configure(fg_color=self.theme["CARD"])
+
+            w, h = 360, 120
+            x = top.winfo_rootx() + top.winfo_width() - w - 20
+            y = top.winfo_rooty() + 20
+            toast.geometry(f"{w}x{h}+{x}+{y}")
+
+            box = ctk.CTkFrame(toast, fg_color=self.theme["CARD"], corner_radius=14)
+            box.pack(fill="both", expand=True, padx=10, pady=10)
+
+            ctk.CTkLabel(box, text=title, text_color=self.theme["TURQ"],
+                         font=("Roboto", 14, "bold")).pack(anchor="w")
+
+            ctk.CTkLabel(box, text=msg, text_color=self.theme["WHITE"],
+                         wraplength=w - 40, justify="left").pack(anchor="w", pady=(6, 0))
+
+            # auto-cerrar
+            toast.after(7000, toast.destroy)
+            return
+
+        except Exception:
+            pass
+
+        # fallback final
+        try:
+            self._bring_to_front()
+            messagebox.showinfo(title, msg)
+        except Exception:
+            pass
+
+    def _break_elapsed_live(self) -> int:
+        # devuelve elapsed actual (si corre, suma lo que va desde start)
+        if self.break_running and self.break_start_ts:
+            return int(self.break_elapsed_sec + (time.time() - self.break_start_ts))
+        return int(self.break_elapsed_sec or 0)
+
+    def _start_break_quick(self):
+        if self.break_running:
+            return
+        self.break_running = True
+        self.break_start_ts = time.time()
+        self._tick_break()  # ya existe
+        self._schedule_break_save()  # ya existe
+        try:
+            self.btn_break_toggle.configure(text="Pausar descanso")
+        except Exception:
+            pass
+        self._save_break_state()
+
+    def _open_break_popup(self):
+        # evita abrir 10 ventanas
+        if getattr(self, "_break_popup", None) and self._break_popup.winfo_exists():
+            try:
+                self._break_popup.lift()
+                return
+            except Exception:
+                pass
+
+        self._break_popup = BreakPopup(
+            self,
+            self.theme,
+            get_elapsed=self._break_elapsed_live,
+            on_pause=self._pause_break,  # ya existe
+            on_start=self._start_break_quick,
+            is_running=lambda: bool(self.break_running),
+        )
+
+    def _open_work_settings(self):
+        cur = getattr(self, "work_settings", None) or _load_work_settings()
+
+        def _saved(d):
+            self.work_settings = d
+            _save_work_settings(d)
+            _event(self.context.get("user_id", ""), "", "WORK_SETTINGS_SAVED", d)
+
+        WorkSettingsPopup(self, self.theme, cur, _saved)
+
+    def _start_notifications_loop(self):
+        # arranca 1 vez y sigue, sin auto-cancelarse al pedo
+        if self._notif_job:
+            return
+        self._notif_job = self.after(self.NOTIF_CHECK_EVERY_MS, self._notifications_tick)
+
+    def _notifications_tick(self):
+        try:
+            now = time.time()
+            actor = self.context.get("user_id", "")
+
+            # --- IDLE (sin timer) ---
+            if not self.timer_running:
+                if self._notif_idle_start_ts is None:
+                    self._notif_idle_start_ts = now
+
+                idle_for = now - float(self._notif_idle_start_ts)
+                can_repeat = (now - float(self._notif_idle_last_ts or 0)) >= float(self.NOTIF_REPEAT_IDLE_SEC)
+
+                # ✅ dispara al llegar al umbral y luego repite cada NOTIF_REPEAT_IDLE_SEC
+                if idle_for >= float(self.NOTIF_NO_TIMER_SEC) and can_repeat:
+                    self._notif_idle_last_ts = now
+                    self._notify(
+                        "Recordatorio",
+                        f"Hace {int(idle_for)}s que no hay ninguna tarea en marcha.\nElegí una tarea y tocá ▶ para empezar."
+                    )
+                    _event(actor, "", "NOTIF_NO_TIMER", {"sec": int(idle_for)})
+
+                # cuando estás idle, reseteamos el contador del otro modo
+                self._notif_running_last_ts = 0.0
+
+            # --- TIMER corriendo ---
+            else:
+                # ✅ reseteamos estado idle
+                self._notif_idle_start_ts = None
+                self._notif_idle_last_ts = 0.0
+
+                if self.timer_start_ts:
+                    run_for = now - float(self.timer_start_ts)
+                    can_repeat = (now - float(self._notif_running_last_ts or 0)) >= float(self.NOTIF_REPEAT_RUNNING_SEC)
+
+                    if run_for >= float(self.NOTIF_TIMER_RUNNING_SEC) and can_repeat:
+                        self._notif_running_last_ts = now
+                        t = self._get_task(self.timer_task_id) if self.timer_task_id else None
+                        title = t.title if t else "Tarea"
+                        self._notify(
+                            "Timer en marcha",
+                            f"Llevás {int(run_for)}s con el timer encendido ({title}).\n¿Lo dejaste andando?"
+                        )
+                        _event(actor, (self.timer_task_id or ""), "NOTIF_TIMER_RUNNING",
+                               {"sec": int(run_for), "task_title": title})
+            # ✅ recordatorios por fin de jornada (además del idle/timer)
+            self._tick_eod_reminders()
+
+
+        finally:
+            try:
+                self._notif_job = self.after(self.NOTIF_CHECK_EVERY_MS, self._notifications_tick)
+            except Exception:
+                self._notif_job = None
+
+    def _week_id_to_monday(self, week_id: str) -> date:
+        """
+        week_id: 'YYYY-Www'  (ej: '2026-W05')
+        devuelve el lunes de esa semana ISO.
+        """
+        try:
+            y, w = week_id.split("-W")
+            y = int(y);
+            w = int(w)
+            # ISO: lunes = 1
+            return date.fromisocalendar(y, w, 1)
+        except Exception:
+            return _week_start_monday(date.today())
+
+    def _week_label_from_week_id(self, week_id: str) -> str:
+        d0 = self._week_id_to_monday(week_id)
+        d1 = d0 + timedelta(days=6)
+        return f"{week_id} ({d0.strftime('%d/%m')}–{d1.strftime('%d/%m')})"
+
+    def _get_available_week_ids(self) -> List[str]:
+        """
+        Devuelve week_ids disponibles: semana actual + archivadas.
+        """
+        weeks = set()
+        weeks.add(_current_week_id())  # ej: '2026-W05'
+
+        archive = _week_totals_archive_file()
+        if os.path.exists(archive):
+            try:
+                with open(archive, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = (line or "").strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            wid = str(data.get("week_id", "")).strip()
+                            if wid:
+                                weeks.add(wid)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        return sorted(list(weeks), reverse=True)
+
+    def _on_week_change(self, label: str):
+        """
+        label viene como '2026-W05 (27/01–02/02)'.
+        Guardamos week_id en self.week_selected.
+        """
+        try:
+            week_id = (label.split(" ")[0] or "").strip()
+            if week_id:
+                self.week_selected = week_id
+        except Exception:
+            pass
+
+        # Si querés que al cambiar refresque vistas:
+        try:
+            self._render_timer_summary()
+        except Exception:
+            pass
+
+    # =========================
+    # TIMER (tu código original)
+    # =========================
+    def _build_timer(self):
+        root = ctk.CTkFrame(self.tab_timer, fg_color="transparent")
+        root.pack(fill="both", expand=True)
+
+        card = ctk.CTkFrame(root, fg_color=self.theme["CARD"], corner_radius=16)
+        card.pack(fill="x", padx=6, pady=(6, 10))
+
+        self.lbl_timer_task = ctk.CTkLabel(card, text="Tarea en curso: —", font=("Roboto", 13, "bold"))
+        self.lbl_timer_task.pack(anchor="w", padx=14, pady=(12, 0))
+
+        self.lbl_timer = ctk.CTkLabel(card, text="00:00", font=("Roboto", 28, "bold"), text_color=self.theme["TURQ"])
+        self.lbl_timer.pack(anchor="w", padx=14, pady=(6, 10))
+
+        btns = ctk.CTkFrame(card, fg_color="transparent")
+        btns.pack(fill="x", padx=14, pady=(0, 12))
+
+        self.btn_pause = ctk.CTkButton(btns, text="Pausar", fg_color="#22324a", hover_color="#2b3e5b",
+                                       width=110, command=self._pause_timer)
+        self.btn_pause.pack(side="left", padx=(0, 8))
+
+        self.btn_finish = ctk.CTkButton(btns, text="Finalizar", fg_color=self.theme["TURQ"], text_color="#001013",
+                                        hover_color="#12b5aa", width=110, command=self._finish_timer)
+        self.btn_finish.pack(side="left")
+
+        self.btn_stop = ctk.CTkButton(btns, text="Detener", fg_color="#22324a", hover_color="#2b3e5b",
+                                      width=110, command=self._stop_timer_no_finish)
+        self.btn_stop.pack(side="left", padx=(8, 0))
+        sep = ctk.CTkFrame(root, fg_color="transparent")
+        sep.pack(fill="x", padx=6, pady=(0, 10))
+
+        break_card = ctk.CTkFrame(root, fg_color=self.theme["CARD"], corner_radius=16)
+        break_card.pack(fill="x", padx=6, pady=(0, 10))
+
+        ctk.CTkLabel(break_card, text="Descanso", font=("Roboto", 13, "bold"),
+                     text_color=self.theme["MUTED"]).pack(anchor="w", padx=14, pady=(12, 0))
+
+        self.lbl_break = ctk.CTkLabel(break_card, text=_fmt_sec(self.break_elapsed_sec), font=("Roboto", 20, "bold"),
+                                      text_color=self.theme["WARN"])
+        self.lbl_break.pack(anchor="w", padx=14, pady=(6, 10))
+
+        bbtns = ctk.CTkFrame(break_card, fg_color="transparent")
+        bbtns.pack(fill="x", padx=14, pady=(0, 12))
+
+        self.btn_break_toggle = ctk.CTkButton(
+            bbtns, text=("Iniciar descanso" if not self.break_running else "Pausar descanso"),
+            fg_color="#22324a", hover_color="#2b3e5b", width=160,
+            command=self._toggle_break
+        )
+        self.btn_break_toggle.pack(side="left")
+
+        self.summary = ctk.CTkFrame(root, fg_color=self.theme["CARD"], corner_radius=16)
+        self.summary.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        ctk.CTkLabel(self.summary, text="Resumen Hoy", font=("Roboto", 13, "bold"),
+                     text_color=self.theme["MUTED"]).pack(anchor="w", padx=14, pady=(12, 6))
+
+        self.summary_list = ctk.CTkScrollableFrame(self.summary, fg_color="transparent")
+        self.summary_list.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+        # =========================
+        # ✅ Selector de semana (SOLO JEFE)
+        # =========================
+        # =========================
+        # ✅ Selector de semana (SOLO JEFE/BOSS)
+        # =========================
+        is_boss = str(self.context.get("role", "")).lower() in ("boss", "jefe")
+
+        if is_boss:
+            week_frame = ctk.CTkFrame(root, fg_color="transparent")
+            week_frame.pack(fill="x", padx=6, pady=(0, 10))
+
+            ctk.CTkLabel(
+                week_frame,
+                text="Ver histórico semanal:",
+                text_color=self.theme["MUTED"]
+            ).pack(side="left", padx=(0, 8))
+
+            week_ids = self._get_available_week_ids()
+
+            # Inicial: si no existe, usa semana actual
+            if not getattr(self, "week_selected", ""):
+                self.week_selected = _current_week_id()
+            if self.week_selected not in week_ids:
+                self.week_selected = week_ids[0] if week_ids else _current_week_id()
+
+            labels = [self._week_label_from_week_id(w) for w in week_ids] or [
+                self._week_label_from_week_id(_current_week_id())]
+
+            self.week_combo = ctk.CTkOptionMenu(
+                week_frame,
+                values=labels,
+                width=260,
+                fg_color=self.theme["CARD2"],
+                button_color=self.theme["CARD2"],
+                command=self._on_week_change
+            )
+            self.week_combo.pack(side="left")
+
+            # set visual
+            try:
+                self.week_combo.set(self._week_label_from_week_id(self.week_selected))
+            except Exception:
+                pass
+
+            ctk.CTkLabel(
+                week_frame,
+                text="Ver histórico semanal:",
+                text_color=self.theme["MUTED"]
+            ).pack(side="left", padx=(0, 8))
+
+            self.week_combo = ctk.CTkComboBox(
+                week_frame,
+                values=self._get_available_weeks(),
+                width=220,
+                command=self._on_week_change
+            )
+            self.week_combo.set(_week_label(self.week_selected))
+            self.week_combo.pack(side="left")
+
+        self._render_timer_state_ui()
+
+    def _toggle_break(self):
+        if not self.break_running:
+            self.break_running = True
+            self.break_start_ts = time.time()
+            self._tick_break()
+            self._schedule_break_save()
+            self.btn_break_toggle.configure(text="Pausar descanso")
+        else:
+            self._pause_break()
+
+    def _pause_break(self):
+        if not self.break_running:
+            return
+        now = time.time()
+        self.break_elapsed_sec += int(now - self.break_start_ts)
+        self.break_running = False
+        self.break_start_ts = 0.0
+        self._save_break_state()
+        self.btn_break_toggle.configure(text="Iniciar descanso")
+        try:
+            if self.break_after_id:
+                self.after_cancel(self.break_after_id)
+                self.break_after_id = None
+        except Exception:
+            pass
+        try:
+            if self.break_save_job:
+                self.after_cancel(self.break_save_job)
+                self.break_save_job = None
+        except Exception:
+            pass
+        self.lbl_break.configure(text=_fmt_sec(self.break_elapsed_sec))
+
+    def _tick_break(self):
+        if not self.break_running:
+            return
+        now = time.time()
+        elapsed = self.break_elapsed_sec + int(now - self.break_start_ts)
+        self.lbl_break.configure(text=_fmt_sec(elapsed))
+        self.break_after_id = self.after(500, self._tick_break)
+
+    def _schedule_break_save(self):
+        # guarda cada 10s mientras corre
+        if not self.break_running:
+            return
+        now = time.time()
+        elapsed = self.break_elapsed_sec + int(now - self.break_start_ts)
+        self.break_elapsed_sec = int(elapsed)
+        self.break_start_ts = now  # reseteo start para que no acumule doble
+        self._save_break_state()
+        self.break_save_job = self.after(10000, self._schedule_break_save)
+
+    def _get_available_weeks(self):
+        # semana actual + semanas archivadas
+        weeks = {_week_key(date.today())}
+
+        archive = os.path.join(_get_appdata_base_dir(), "week_totals_archive.jsonl")
+        if os.path.exists(archive):
+            with open(archive, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        if "week_id" in data:
+                            weeks.add(data["week_id"])
+                    except:
+                        pass
+
+        return [_week_label(w) for w in sorted(weeks, reverse=True)]
+
+    def _on_week_change(self, label: str):
+        # convierte label a week_key
+        for w in self._get_available_weeks():
+            if w == label:
+                self.week_selected = w
+                break
+        self.refresh()
+
+    def _week_filter(self, entry_date: date) -> bool:
+        ws = date.fromisoformat(self.week_selected)
+        we = ws + timedelta(days=6)
+        return ws <= entry_date <= we
+
+    def _render_timer_state_ui(self):
+        running = self.timer_running and self.timer_task_id
+        self.btn_pause.configure(state=("normal" if running else "disabled"))
+        self.btn_finish.configure(state=("normal" if running else "disabled"))
+        self.btn_stop.configure(state=("normal" if running else "disabled"))
+
+    def _render_timer_summary(self):
+        for w in self.summary_list.winfo_children():
+            w.destroy()
+
+        today = _today_str()
+        touched: Dict[str, int] = {}
+        for t in self.filtered_tasks:
+            sec = 0
+            for e in t.time_entries:
+                stop = e.stop_at or ""
+                if not stop:
+                    continue
+
+                # =========================
+                # ✅ JEFE → filtra por semana
+                # =========================
+                if str(getattr(self, "role", "")).lower() == "jefe":
+                    try:
+                        d = date.fromisoformat(stop[:10])  # YYYY-MM-DD
+                    except:
+                        continue
+
+                    if not self._week_filter(d):
+                        continue
+
+                    sec += int(e.duration_sec or 0)
+
+                # =========================
+                # 👤 EMPLEADO → solo hoy
+                # =========================
+                else:
+                    if stop.startswith(today):
+                        sec += int(e.duration_sec or 0)
+
+            if sec > 0:
+                touched[t.task_id] = touched.get(t.task_id, 0) + sec
+
+        for tid, sec in sorted(touched.items(), key=lambda x: x[1], reverse=True):
+            t = self._get_task(tid)
+            row = ctk.CTkFrame(self.summary_list, fg_color=self.theme["CARD2"], corner_radius=14)
+            row.pack(fill="x", pady=5, padx=6)
+
+            name = t.title if t else "—"
+            ctk.CTkLabel(row, text=name, anchor="w").pack(side="left", expand=True, fill="x", padx=10, pady=10)
+            ctk.CTkLabel(row, text=_fmt_sec(sec), text_color=self.theme["MUTED"]).pack(side="right", padx=10)
+
+    def _start_timer_for(self, t: Task):
+        if self.timer_running:
+            messagebox.showinfo("Timer", "Ya hay un timer corriendo. Pausalo o finalizalo primero.")
+            return
+        self.timer_task_id = t.task_id
+        self.timer_running = True
+        self.timer_start_ts = time.time()
+        self.timer_elapsed_sec = 0
+        self.lbl_timer_task.configure(text=f"Tarea en curso: {t.title}")
+        _event(self.context.get("user_id", ""), t.task_id, "TIMER_STARTED", {"title": t.title})
+        self._tick_timer()
+        # ✅ notificaciones
+        self._notif_idle_sent = False
+        self._notif_running_sent = False
+
+        self._render_timer_state_ui()
+        self._render_agenda()  # ✅ para que el chip cambie ▶ -> ⏸
+
+    def _tick_timer(self):
+        if not self.timer_running:
+            return
+        now = time.time()
+        self.timer_elapsed_sec = int(now - self.timer_start_ts)
+        m = self.timer_elapsed_sec // 60
+        s = self.timer_elapsed_sec % 60
+        self.lbl_timer.configure(text=f"{m:02d}:{s:02d}")
+        # ✅ también refresca el timer visible en el chip de Agenda
+        try:
+            if self.timer_task_id and self.timer_task_id in self._chip_timer_labels:
+                m = self.timer_elapsed_sec // 60
+                s = self.timer_elapsed_sec % 60
+                self._chip_timer_labels[self.timer_task_id].configure(text=f"{m:02d}:{s:02d}")
+        except Exception:
+            pass
+
+        self.timer_after_id = self.after(500, self._tick_timer)
+
+    def _pause_timer(self):
+        if not self.timer_running or not self.timer_task_id:
+            return
+        stop = _iso_now()
+        start = datetime.fromtimestamp(self.timer_start_ts).isoformat(timespec="seconds")
+        dur = int(time.time() - self.timer_start_ts)
+        self._add_time_entry(self.timer_task_id, TimeEntry(
+            mode="TIMER", actor=self.context.get("user_id", ""),
+            start_at=start, stop_at=stop, duration_sec=dur, note=""
+        ))
+        _event(self.context.get("user_id", ""), self.timer_task_id, "TIMER_STOPPED", {"duration_sec": dur})
+        self.timer_running = False
+        # ✅ vuelve a modo "sin timer"
+        self._notif_idle_start_ts = time.time()
+        self._notif_idle_sent = False
+
+        # ✅ al pausar, el chip vuelve a mostrar total acumulado
+        try:
+            t = self._get_task(self.timer_task_id) if self.timer_task_id else None
+            if t and t.task_id in self._chip_timer_labels:
+                week_sec = int(getattr(self, "_week_totals", {}).get(t.task_id, 0) or 0)
+                self._chip_timer_labels[t.task_id].configure(text=_fmt_sec(week_sec))
+
+        except Exception:
+            pass
+
+        self._render_timer_state_ui()
+        self.lbl_timer.configure(text="00:00")
+        self._render_agenda()  # ✅ para que el chip cambie ⏸ -> ▶
+
+    def _stop_timer_no_finish(self):
+        if not self.timer_running:
+            return
+        self._pause_timer()
+
+    def _finish_timer(self):
+        if not self.timer_running or not self.timer_task_id:
+            return
+        self._pause_timer()
+        t = self._get_task(self.timer_task_id)
+        if not t:
+            return
+        self._complete_task(t)
+
+    def _finish_manual(self, t: Task):
+        win = ctk.CTkInputDialog(text="Ingresá minutos invertidos (obligatorio):", title="Finalizar manual")
+        val = (win.get_input() or "").strip()
+        try:
+            mins = int(val)
+            if mins <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Error", "Minutos inválidos.")
+            return
+
+        dur = mins * 60
+        entry = TimeEntry(mode="MANUAL", actor=self.context.get("user_id", ""), duration_sec=dur,
+                          start_at="", stop_at=_iso_now(), note="manual")
+        self._add_time_entry(t.task_id, entry)
+        _event(self.context.get("user_id", ""), t.task_id, "TIME_ADDED_MANUAL", {"duration_sec": dur})
+        self._complete_task(t)
+
+    def _add_time_entry(self, task_id: str, entry: TimeEntry):
+        try:
+            self.api.add_time_entry(self.context, task_id, entry)
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo guardar tiempo: {e}")
+            return
+
+        # ✅ suma al contador semanal
+        try:
+            self._weekly_rollover_if_needed()
+            sec = int(entry.duration_sec or 0)
+            self._week_totals[task_id] = int(self._week_totals.get(task_id, 0)) + sec
+            if self._week_totals[task_id] < 0:
+                self._week_totals[task_id] = 0
+            self._save_week_totals()
+        except Exception:
+            pass
+
+        self.refresh()
+
+    def _complete_task(self, t: Task):
+        if int(t.time_total_sec or 0) <= 0:
+            messagebox.showerror("Error", "No se puede finalizar sin tiempo.")
+            return
+        t.status = "DONE"
+        t.completed_at = _iso_now()
+        try:
+            self.api.update_task(self.context, t)
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo finalizar: {e}")
+            return
+        _event(self.context.get("user_id", ""), t.task_id, "TASK_COMPLETED", {"time_total_sec": t.time_total_sec})
+        self.timer_task_id = None
+        self.timer_running = False
+        self.lbl_timer_task.configure(text="Tarea en curso: —")
+        self.lbl_timer.configure(text="00:00")
+        self._render_timer_state_ui()
+        self.refresh()
+
+
+# =========================
+# Helper de construcción
+# =========================
+def build_tasks_module(parent, context: Dict[str, Any],
+                       api: Optional[TasksAPI] = None,
+                       theme: Optional[Dict[str, str]] = None,
+                       on_request_user_list: Optional[Callable[[], List[str]]] = None) -> TasksModule:
+    return TasksModule(parent, context=context, api=api, theme=theme, on_request_user_list=on_request_user_list)
