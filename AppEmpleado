@@ -1,0 +1,1599 @@
+# appEmpleado.py
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import messagebox
+import socket
+import threading
+import time
+import os
+import json
+from typing import Tuple, Optional
+# ✅ TAREAS
+from tasks_module import TasksModule, DEFAULT_THEME
+
+# ✅ NUEVO: capturas + actividad
+import io
+from datetime import datetime
+
+# screenshot (usa PIL internamente)
+import pyautogui
+
+# ✅ IMPORT DEL MÓDULO COMPARTIDO DE TAREAS
+from tasks_module import TasksModule
+import hashlib
+from tkinter import filedialog
+from zoneinfo import ZoneInfo
+
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
+# =========================
+# CONFIG
+# =========================
+DEFAULT_HOST = "185.254.207.202"
+DEFAULT_PORT = 5555
+
+ctk.set_appearance_mode("Dark")
+
+TURQ = "#19d3c5"
+NAVY = "#0b1b2b"
+WHITE = "#ffffff"
+CARD = "#142235"
+CARD2 = "#101a2a"
+MUTED = "#9aa7b3"
+DANGER = "#e74c3c"
+OK = "#2ecc71"
+
+APP_W = 1200
+APP_H = 780
+import os
+import json
+import time
+import threading
+from datetime import datetime
+
+_GCAL_LOG_LOCK = threading.Lock()
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def _now_iso():
+    # ISO simple y consistente
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def _safe_json(obj):
+    """
+    Asegura que no haya tipos raros (datetime, etc).
+    Convierte lo no serializable a str.
+    """
+    def default(o):
+        return str(o)
+    return json.dumps(obj, ensure_ascii=False, default=default)
+
+def append_jsonl(file_path: str, record: dict):
+    """
+    Appendea 1 línea JSON por record. Seguro con lock.
+    """
+    ensure_dir(os.path.dirname(file_path) or ".")
+    line = _safe_json(record) + "\n"
+    with _GCAL_LOG_LOCK:
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+def normalize_gcal_item(raw: dict, user_id: str) -> dict:
+    """
+    Normaliza lo mínimo para que SIEMPRE quede con el mismo formato
+    aunque Google cambie campos o falte algo.
+    """
+    # start/end pueden venir como {"dateTime": "..."} o {"date": "..."}
+    start = raw.get("start") or {}
+    end = raw.get("end") or {}
+
+    start_val = start.get("dateTime") or start.get("date") or ""
+    end_val = end.get("dateTime") or end.get("date") or ""
+
+    rec = {
+        "source": "google_calendar",
+        "ts_saved_utc": _now_iso(),
+        "user_id": user_id,
+        "event": {
+            "id": raw.get("id", ""),
+            "summary": raw.get("summary", ""),
+            "description": raw.get("description", ""),
+            "location": raw.get("location", ""),
+            "start": start_val,
+            "end": end_val,
+            "status": raw.get("status", ""),
+            "htmlLink": raw.get("htmlLink", ""),
+            "updated": raw.get("updated", ""),
+            "created": raw.get("created", ""),
+            "organizer": raw.get("organizer", {}),
+            "attendees": raw.get("attendees", []),
+        },
+        # guardamos el bruto también por si después querés “reprocesar”
+        "raw": raw,
+    }
+    return rec
+
+def log_gcal_items(items: list, user_id: str, base_dir: str = None):
+    """
+    Guarda una tanda de items (eventos/tareas) como JSONL.
+    Archivo por usuario, para que sea fácil de consumir.
+    """
+    if base_dir is None:
+        base_dir = gcal_logs_dir()
+
+    fp = os.path.join(base_dir, f"gcal_{user_id}.jsonl")
+    for it in items:
+        rec = normalize_gcal_item(it if isinstance(it, dict) else {"value": it}, user_id)
+        append_jsonl(fp, rec)
+
+def log_gcal_print_line(print_text: str, user_id: str, base_dir: str = None):
+    """
+    Si lo único que tenés hoy es el texto que se imprime (string),
+    guardalo igual (no perdemos nada).
+    """
+    if base_dir is None:
+        base_dir = gcal_logs_dir()
+
+    fp = os.path.join(base_dir, f"gcal_{user_id}.jsonl")
+    rec = {
+        "source": "google_calendar",
+        "ts_saved_utc": _now_iso(),
+        "user_id": user_id,
+        "print_line": str(print_text),
+    }
+    append_jsonl(fp, rec)
+
+
+# =========================
+# Helpers: appdata dirs
+# =========================
+def get_appdata_base_dir() -> str:
+    base = os.getenv("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(base, "CSDViajes", "KClient")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+import os
+from pathlib import Path
+
+def get_appdata_dir(app_name: str = "K-Client") -> Path:
+    """
+    Devuelve carpeta base en %APPDATA% (Roaming) para guardar datos.
+    Ej: C:\\Users\\X\\AppData\\Roaming\\K-Client
+    """
+    base = os.getenv("APPDATA")  # Roaming
+    if not base:
+        # fallback raro, pero por si acaso
+        base = str(Path.home() / "AppData" / "Roaming")
+    p = Path(base) / app_name
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+# =========================
+# ✅ Google Calendar logs en AppData
+# =========================
+def _gcal_state_path_for_user(user_id: str) -> str:
+    # AppData\K-Client\gcal_logs\gcal_state_<user>.json
+    base = gcal_logs_dir()
+    return os.path.join(base, f"gcal_state_{user_id}.json")
+
+def _safe_json_min(obj) -> str:
+    def default(o):
+        return str(o)
+    # separators para que sea 1 línea compacta
+    return json.dumps(obj, ensure_ascii=False, default=default, separators=(",", ":"))
+
+def _event_start_date_str(raw_event: dict) -> str:
+    """
+    Devuelve YYYY-MM-DD (si all-day) o YYYY-MM-DD de dateTime.
+    """
+    start = (raw_event or {}).get("start") or {}
+    if start.get("date"):
+        return str(start.get("date") or "")
+    dt = start.get("dateTime") or ""
+    return str(dt)[:10] if dt else ""
+
+def gcal_logs_dir() -> str:
+    # Usamos tu helper de Path y lo convertimos a str
+    p = get_appdata_dir("K-Client") / "gcal_logs"
+    p.mkdir(parents=True, exist_ok=True)
+    return str(p)
+
+def cred_file_path() -> str:
+    return os.path.join(get_appdata_base_dir(), "credenciales.txt")
+def google_client_path() -> str:
+    return os.path.join(get_appdata_base_dir(), "google_client.json")
+
+def google_token_path() -> str:
+    return os.path.join(get_appdata_base_dir(), "google_token.json")
+
+# =========================
+# UI: barra superior
+# =========================
+class WindowChrome(ctk.CTkFrame):
+    def __init__(self, master, title_left: str, wifi_text: str = "Wi-Fi: --", on_close=None):
+        super().__init__(master, fg_color="transparent", height=44)
+        self.on_close = on_close
+        self.pack_propagate(False)
+
+        left = ctk.CTkFrame(self, fg_color="transparent")
+        left.pack(side="left", padx=12, pady=0)
+
+        self.lbl_title = ctk.CTkLabel(left, text=title_left, text_color=WHITE, font=("Roboto", 14, "bold"))
+        self.lbl_title.pack(side="left", pady=0)
+
+        self.lbl_wifi = ctk.CTkLabel(left, text=f"   {wifi_text}", text_color=MUTED, font=("Roboto", 11))
+        self.lbl_wifi.pack(side="left", padx=(8, 0), pady=0)
+
+        right = ctk.CTkFrame(self, fg_color="transparent")
+        right.pack(side="right", padx=10, pady=0)
+
+        ctk.CTkButton(
+            right, text="Cerrar ✕", width=90, fg_color="#22324a",
+            hover_color="#2b3e5b", command=self._close
+        ).pack(side="right")
+
+    def set_wifi(self, text: str):
+        try:
+            self.lbl_wifi.configure(text=f"   {text}")
+        except Exception:
+            pass
+
+    def set_title(self, text: str):
+        try:
+            self.lbl_title.configure(text=text)
+        except Exception:
+            pass
+
+    def _close(self):
+        if self.on_close:
+            self.on_close()
+        else:
+            self.winfo_toplevel().destroy()
+from datetime import datetime, timedelta, timezone
+
+# =========================
+# App Empleado
+# =========================
+class AppEmpleado(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Prod Manager • Empleado")
+        self.geometry(f"{APP_W}x{APP_H}")
+        self.configure(fg_color=NAVY)
+
+        # socket state
+        self.sock: Optional[socket.socket] = None
+        self.socket_lock = threading.Lock()
+        self.connected = False
+        self._listen_stop = threading.Event()
+        # ✅ Google Calendar: forzar 1 sync completo por sesión (evita quedarte sin enviar nunca)
+        self._gcal_force_full_sync_once = True
+
+        # usuario/rol
+        self.current_user: str = ""
+        self.current_role: str = "employee"  # forzado a employee acá
+
+        # reconexión
+        self._reconnect_in_progress = False
+        self._reconnect_after_id = None
+        self._reconnect_interval_ms = 10_000  # igual que tu jefe
+
+        # UI refs
+        self.login_root = None
+        self.chrome = None
+        self.main_root = None
+        self.lbl_status = None
+        self.btn_reconnect = None
+        # ✅ Google Calendar → dedupe envío server
+        self._gcal_sent_state = {}   # key -> last_updated_or_etag
+        self._gcal_state_loaded_for = None
+
+        # ✅ NUEVO: refs módulo
+        self.tasks_view = None
+
+        # ✅ NUEVO: buffer listener (líneas)
+        self._recv_buf = bytearray()
+
+        # ✅ NUEVO: capturas / actividad / keepalive / cfg
+        self._ss_after_id = None
+        self._ss_interval_ms = 600000  # 3 segundos
+        self._ss_only_on_change = True
+        self._ss_last_hash = None
+
+        self._activity_after_id = None
+        self._activity_tick_ms = 5000
+        self._activity_last_ts = time.time()
+        self._activity_delta = {}  # app -> {"fg":sec,"bg":sec}
+        # =========================
+        # ✅ GOOGLE CALENDAR
+        # =========================
+        self._gc_service = None
+        self._gc_scopes = ["https://www.googleapis.com/auth/calendar.readonly"]
+        self._gc_after_id = None
+
+        # UI refs Google
+        self.gc_status_lbl = None
+        self.gc_events_scroll = None
+        self.gc_next_run_lbl = None
+        self.gc_client_text = None
+
+        self._keepalive_after_id = None
+        self._keepalive_ms = 8000
+
+        self._cfg_version = 0
+        self._cfg_keywords = []
+
+        # arrancar
+        self._build_login_ui()
+
+        # autoload creds y autoconectar
+        self.after(250, self._autoload_and_autoconnect)
+
+    # =========================
+    # LOGIN UI
+    # =========================
+    def _build_login_ui(self):
+        self.login_root = ctk.CTkFrame(self, fg_color=NAVY)
+        self.login_root.pack(fill="both", expand=True)
+
+        card = ctk.CTkFrame(self.login_root, fg_color=CARD, corner_radius=18)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+
+        ctk.CTkLabel(card, text="🔐 Acceso Empleado", font=("Roboto", 18, "bold"), text_color=TURQ)\
+            .pack(anchor="w", padx=18, pady=(16, 6))
+
+        self.user_entry = ctk.CTkEntry(card, width=320, placeholder_text="Usuario", fg_color=CARD2)
+        self.user_entry.pack(padx=18, pady=(8, 8))
+
+        self.pass_entry = ctk.CTkEntry(card, width=320, placeholder_text="Contraseña", fg_color=CARD2, show="*")
+        self.pass_entry.pack(padx=18, pady=(0, 8))
+
+        self.btn_login = ctk.CTkButton(
+            card, text="Conectar", width=320, fg_color=TURQ, text_color="#001013",
+            hover_color="#12b5aa", command=self._do_login
+        )
+        self.btn_login.pack(padx=18, pady=(6, 14))
+
+        self.lbl_status = ctk.CTkLabel(card, text="Estado: Desconectado", text_color=DANGER, font=("Roboto", 11))
+        self.lbl_status.pack(anchor="w", padx=18, pady=(0, 14))
+
+        self.user_entry.bind("<Return>", lambda _e: self._do_login())
+        self.pass_entry.bind("<Return>", lambda _e: self._do_login())
+
+        # cargar creds si existen
+        self._load_creds()
+    # =========================
+    # ✅ GCAL -> SERVER SYNC (task_google_calendar|user|date|json)
+    # =========================
+    def _gcal_load_sent_state(self):
+        """
+        Carga el estado de dedupe desde AppData (por usuario).
+        """
+        try:
+            if not self.current_user:
+                return
+            if self._gcal_state_loaded_for == self.current_user:
+                return
+
+            fp = _gcal_state_path_for_user(self.current_user)
+            if os.path.exists(fp):
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._gcal_sent_state = data if isinstance(data, dict) else {}
+            else:
+                self._gcal_sent_state = {}
+
+            self._gcal_state_loaded_for = self.current_user
+        except Exception:
+            self._gcal_sent_state = {}
+            self._gcal_state_loaded_for = self.current_user
+
+    def _gcal_save_sent_state(self):
+        """
+        Guarda el estado de dedupe en AppData.
+        """
+        try:
+            if not self.current_user:
+                return
+            fp = _gcal_state_path_for_user(self.current_user)
+            ensure_dir(os.path.dirname(fp) or ".")
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump(self._gcal_sent_state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _gcal_make_dedupe_key(self, raw_event: dict) -> str:
+        """
+        Key estable para dedupe.
+        - Usa id + start (para diferenciar instancias si alguna vez fueran recurrentes).
+        """
+        ev_id = (raw_event or {}).get("id", "") or ""
+        start_date = _event_start_date_str(raw_event) or ""
+        return f"{ev_id}|{start_date}"
+
+    def _gcal_event_version(self, raw_event: dict) -> str:
+        """
+        Versión objetiva del evento:
+        - Preferimos etag si existe (suele cambiar cuando cambia el evento).
+        - Si no, usamos updated.
+        """
+        etag = (raw_event or {}).get("etag", "")
+        upd = (raw_event or {}).get("updated", "")
+        return etag or upd or ""
+
+    def _gcal_send_events_to_server(self, events: list):
+        """
+        Manda al server:
+          TASK_GOOGLE_CALENDAR|user|date|<json>
+        - En modo normal: dedupe por (id|start_date) y versión (etag/updated).
+        - Parche: 1 vez por sesión, fuerza FULL SYNC (manda todo aunque esté dedupeado),
+          para evitar el caso “nunca se imprime / nunca manda nada”.
+        """
+        # ✅ Debug claro de por qué no entra
+        if not (self.connected and self.sock):
+            print("[GCAL->SERVER] skip: no conectado o sin socket")
+            return
+        if not self.current_user:
+            print("[GCAL->SERVER] skip: current_user vacío")
+            return
+        if not events:
+            print("[GCAL->SERVER] skip: 0 eventos para enviar")
+            return
+
+        self._gcal_load_sent_state()
+
+        force_full = bool(getattr(self, "_gcal_force_full_sync_once", False))
+        if force_full:
+            print("[GCAL->SERVER] FULL SYNC (1 vez por sesión): enviando todos los eventos")
+
+        sent_any = False
+
+        for ev in (events or []):
+            if not isinstance(ev, dict):
+                continue
+
+            key = self._gcal_make_dedupe_key(ev)
+            ver = self._gcal_event_version(ev)
+
+            # ✅ Si NO estamos forzando full sync, aplicamos dedupe normal
+            if not force_full:
+                # Si ya lo mandamos con la misma versión, skip
+                if key and ver and self._gcal_sent_state.get(key) == ver:
+                    continue
+
+                # Si no hay ver (raro), igual mandamos una vez por key
+                if key and not ver and key in self._gcal_sent_state:
+                    continue
+
+            date_str = _event_start_date_str(ev) or ""
+            payload = {
+                "source": "google_calendar",
+                "ts_saved_utc": _now_iso(),
+                "user_id": self.current_user,
+                "event": ev
+            }
+
+            payload_json = _safe_json_min(payload)
+
+            # ✅ CRÍTICO: evitar '|' dentro del JSON
+            payload_json = payload_json.replace("|", "\\u007c")
+
+            line = "TASK_GOOGLE_CALENDAR2|" + self.current_user + "|" + date_str + "|" + payload_json
+
+            # ✅ Este print ahora sí va a aparecer al menos 1 vez por sesión (FULL SYNC)
+            print(line)
+
+            self._send_line(line)
+
+            # actualizar dedupe
+            if key:
+                self._gcal_sent_state[key] = ver or "sent"
+                sent_any = True
+
+        if sent_any:
+            self._gcal_save_sent_state()
+
+        # ✅ Apagar el “full sync” para volver a dedupe normal
+        if force_full:
+            self._gcal_force_full_sync_once = False
+
+    def _autoload_and_autoconnect(self):
+        try:
+            u = self.user_entry.get().strip()
+            pw = self.pass_entry.get().strip()
+            if u and pw:
+                self._do_login()
+        except Exception:
+            pass
+    # =========================
+    # ✅ GOOGLE CALENDAR HELPERS
+    # =========================
+    def _gc_load_service(self) -> bool:
+        """
+        Carga/renueva credenciales desde AppData y construye el service.
+        """
+        try:
+            client_fp = google_client_path()
+            token_fp = google_token_path()
+
+            if not os.path.exists(client_fp):
+                self._gc_service = None
+                return False
+
+            creds = None
+            if os.path.exists(token_fp):
+                creds = Credentials.from_authorized_user_file(token_fp, self._gc_scopes)
+
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                with open(token_fp, "w", encoding="utf-8") as f:
+                    f.write(creds.to_json())
+
+            if not creds or not creds.valid:
+                self._gc_service = None
+                return False
+
+            self._gc_service = build("calendar", "v3", credentials=creds)
+            return True
+
+        except Exception:
+            self._gc_service = None
+            return False
+
+    def _gc_connect_flow(self):
+        """
+        Inicia OAuth en el navegador y guarda token en AppData.
+        """
+        try:
+            client_fp = google_client_path()
+            if not os.path.exists(client_fp):
+                messagebox.showerror(
+                    "Google Calendar",
+                    "No encuentro google_client.json en AppData.\nPegá el JSON o cargalo con 'Seleccionar archivo'."
+                )
+                return
+
+            flow = InstalledAppFlow.from_client_secrets_file(client_fp, scopes=self._gc_scopes)
+            creds = flow.run_local_server(port=0)
+
+            with open(google_token_path(), "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+
+            ok = self._gc_load_service()
+            self._gc_update_status_ui(ok)
+            if ok:
+                self._gc_refresh_week_events()
+                self._gc_schedule_hourly_at_minute_10()
+
+        except Exception as e:
+            messagebox.showerror("Google Calendar", f"No se pudo conectar: {e}")
+
+    def _gc_disconnect(self):
+        """
+        “Desconecta” borrando token local.
+        """
+        try:
+            fp = google_token_path()
+            if os.path.exists(fp):
+                os.remove(fp)
+        except Exception:
+            pass
+
+        self._gc_service = None
+        self._gc_update_status_ui(False)
+        self._gc_clear_events()
+        self._gc_cancel_schedule()
+
+    def _gc_save_client_json_text(self):
+        """
+        Guarda el JSON de credenciales (OAuth Desktop) pegado en la caja.
+        """
+        raw = ""
+        try:
+            raw = (self.gc_client_text.get("0.0", "end") or "").strip()
+        except Exception:
+            pass
+
+        if not raw:
+            messagebox.showerror("Google Calendar", "Pegá el JSON de credenciales primero.")
+            return
+
+        try:
+            # validar que sea JSON
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("JSON inválido")
+
+            with open(google_client_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            messagebox.showinfo("Google Calendar", "Credenciales guardadas en AppData.")
+            self._gc_update_status_ui(self._gc_load_service())
+
+        except Exception as e:
+            messagebox.showerror("Google Calendar", f"No pude guardar el JSON: {e}")
+
+    def _gc_select_client_json_file(self):
+        """
+        Permite seleccionar el client_secret.json y lo copia a AppData como google_client.json
+        """
+        try:
+            fp = filedialog.askopenfilename(
+                title="Seleccionar client_secret.json",
+                filetypes=[("JSON", "*.json")]
+            )
+            if not fp:
+                return
+
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            with open(google_client_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            messagebox.showinfo("Google Calendar", "Archivo guardado en AppData.")
+            self._gc_update_status_ui(self._gc_load_service())
+
+        except Exception as e:
+            messagebox.showerror("Google Calendar", f"No pude copiar el archivo: {e}")
+
+    def _gc_update_status_ui(self, connected: bool):
+        try:
+            if self.gc_status_lbl and self.gc_status_lbl.winfo_exists():
+                self.gc_status_lbl.configure(
+                    text=("Estado: Conectado" if connected else "Estado: Desconectado"),
+                    text_color=(OK if connected else DANGER)
+                )
+        except Exception:
+            pass
+
+    from datetime import datetime, timedelta, timezone
+
+    def _gc_week_range(self):
+        """
+        Devuelve (timeMin, timeMax) ISO para la semana actual en UTC:
+        lunes 00:00 UTC → lunes siguiente 00:00 UTC
+        """
+        now = datetime.now(timezone.utc)
+        monday = (now.replace(hour=0, minute=0, second=0, microsecond=0)
+                  - timedelta(days=now.weekday()))
+        next_monday = monday + timedelta(days=7)
+
+        # Google acepta RFC3339, esto queda perfecto en UTC
+        timeMin = monday.isoformat().replace("+00:00", "Z")
+        timeMax = next_monday.isoformat().replace("+00:00", "Z")
+        return timeMin, timeMax
+
+    def _gc_schedule_hourly_at_minute_10(self):
+        """
+        Ejecuta refresh cada hora al minuto 10 usando hora local del PC (naive),
+        sin ZoneInfo.
+        """
+        self._gc_cancel_schedule()
+
+        now = datetime.now()  # hora local del sistema
+        target = now.replace(minute=10, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(hours=1)
+
+        ms = int((target - now).total_seconds() * 1000)
+
+        def run_and_reschedule():
+            self._gc_refresh_week_events()
+            self._gc_schedule_hourly_at_minute_10()
+
+        try:
+            if self.gc_next_run_lbl and self.gc_next_run_lbl.winfo_exists():
+                self.gc_next_run_lbl.configure(text=f"Próxima actualización: {target.strftime('%H:%M')}")
+        except Exception:
+            pass
+
+        self._gc_after_id = self.after(ms, run_and_reschedule)
+
+    def _gc_clear_events(self):
+        try:
+            if self.gc_events_scroll and self.gc_events_scroll.winfo_exists():
+                for w in self.gc_events_scroll.winfo_children():
+                    w.destroy()
+        except Exception:
+            pass
+
+    def _gc_render_events(self, events):
+        self._gc_clear_events()
+
+        if not events:
+            empty = ctk.CTkLabel(self.gc_events_scroll, text="No hay eventos esta semana.", text_color=MUTED)
+            empty.pack(anchor="w", padx=10, pady=10)
+            return
+
+        for ev in events:
+            title = (ev.get("summary") or "Sin título").strip()
+            start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date") or ""
+            end = ev.get("end", {}).get("dateTime") or ev.get("end", {}).get("date") or ""
+            loc = (ev.get("location") or "").strip()
+
+            card = ctk.CTkFrame(self.gc_events_scroll, fg_color=CARD, corner_radius=14)
+            card.pack(fill="x", padx=10, pady=8)
+
+            ctk.CTkLabel(card, text=title, font=("Roboto", 13, "bold"), text_color=WHITE)\
+                .pack(anchor="w", padx=12, pady=(10, 2))
+
+            meta = f"{start} → {end}"
+            if loc:
+                meta += f"   |   {loc}"
+
+            ctk.CTkLabel(card, text=meta, font=("Roboto", 11), text_color=MUTED)\
+                .pack(anchor="w", padx=12, pady=(0, 10))
+
+    def _gc_fetch_week_events(self):
+        if not self._gc_service:
+            return []
+
+        timeMin, timeMax = self._gc_week_range()
+        events_result = self._gc_service.events().list(
+            calendarId="primary",
+            timeMin=timeMin,
+            timeMax=timeMax,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=250
+        ).execute()
+
+        return events_result.get("items", []) or []
+
+    def _gc_refresh_week_events(self):
+        ok = self._gc_load_service()
+        self._gc_update_status_ui(ok)
+        if not ok:
+            return
+
+        try:
+            events = self._gc_fetch_week_events()
+            # ✅ Guardar eventos en AppData (JSONL)
+            try:
+                log_gcal_items(events, user_id=self.current_user)
+                # opcional: ver ruta una vez
+                print("GCAL guardado en:", os.path.join(gcal_logs_dir(), f"gcal_{self.current_user}.jsonl"))
+            except Exception as e:
+                print("No se pudo guardar GCAL:", e)
+            # ✅ Enviar al server SOLO lo nuevo/actualizado
+            try:
+                self._gcal_send_events_to_server(events)
+            except Exception as e:
+                print("No se pudo enviar GCAL al server:", e)
+
+            print("\n=== GOOGLE CALENDAR: EVENTOS DE LA SEMANA ===")
+            for ev in events:
+                title = (ev.get("summary") or "Sin título").strip()
+                start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date") or ""
+                print(f"- {start} | {title}")
+
+            self._gc_render_events(events)
+
+        except Exception as e:
+            messagebox.showerror("Google Calendar", f"Error al leer eventos: {e}")
+
+    def _gc_cancel_schedule(self):
+        try:
+            if self._gc_after_id:
+                self.after_cancel(self._gc_after_id)
+        except Exception:
+            pass
+        self._gc_after_id = None
+
+
+
+    def _load_creds(self):
+        p = cred_file_path()
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    lines = [x.strip() for x in f.read().splitlines() if x.strip()]
+                if len(lines) >= 2:
+                    self.user_entry.delete(0, "end")
+                    self.user_entry.insert(0, lines[0])
+                    self.pass_entry.delete(0, "end")
+                    self.pass_entry.insert(0, lines[1])
+            except Exception:
+                pass
+
+    def _save_creds(self, u: str, pw: str):
+        try:
+            with open(cred_file_path(), "w", encoding="utf-8") as f:
+                f.write(u.strip() + "\n" + pw.strip() + "\n")
+        except Exception:
+            pass
+
+    # =========================
+    # Conexión + Login
+    # =========================
+    def _connect(self, host: str, port: int) -> bool:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(6)
+            s.connect((host, port))
+            s.settimeout(None)
+            self.sock = s
+            self.connected = True
+            return True
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Error", f"No se pudo conectar: {e}"))
+            self.connected = False
+            self.sock = None
+            return False
+
+    def _do_login(self):
+        u = self.user_entry.get().strip()
+        pw = self.pass_entry.get().strip()
+
+        if not u or not pw:
+            messagebox.showerror("Error", "Usuario y contraseña requeridos.")
+            return
+
+        self.btn_login.configure(state="disabled", text="Conectando…")
+
+        def task():
+            ok = self._connect(DEFAULT_HOST, DEFAULT_PORT)
+            if not ok:
+                self.after(0, lambda: self.btn_login.configure(state="normal", text="Conectar"))
+                return
+
+            # protocolo real: "user,pass" y respuesta "OK,..."
+            try:
+                with self.socket_lock:
+                    self.sock.sendall(f"{u},{pw}".encode("utf-8"))
+                resp_raw = self.sock.recv(1024).decode("utf-8", errors="ignore").strip()
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Error", f"No se pudo loguear: {e}"))
+                self.after(0, lambda: self.btn_login.configure(state="normal", text="Conectar"))
+                return
+
+            if not resp_raw.startswith("OK"):
+                try:
+                    with self.socket_lock:
+                        self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+                self.connected = False
+                self.after(0, lambda: messagebox.showerror("Error", "Acceso Denegado"))
+                self.after(0, lambda: self.btn_login.configure(state="normal", text="Conectar"))
+                return
+
+            # ⚠️ si el server te devuelve "jefe" por error, igual abrimos empleado (para no mezclar apps)
+            self.current_role = "employee"
+            self.current_user = u
+            # ✅ al iniciar sesión, forzamos 1 sync completo
+            self._gcal_force_full_sync_once = True
+
+            self._save_creds(u, pw)
+
+            # arrancar listener
+            self._listen_stop.clear()
+            threading.Thread(target=self._listen_loop, daemon=True).start()
+
+            self.after(0, self._enter_main_ui)
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # =========================
+    # RECONEXIÓN
+    # =========================
+    def _get_saved_creds(self) -> Tuple[str, str]:
+        try:
+            p = cred_file_path()
+            if not os.path.exists(p):
+                return "", ""
+            with open(p, "r", encoding="utf-8") as f:
+                lines = [x.strip() for x in f.read().splitlines() if x.strip()]
+            if len(lines) >= 2:
+                return lines[0], lines[1]
+        except Exception:
+            pass
+        return "", ""
+
+    def _set_connection_state(self, is_connected: bool):
+        self.connected = bool(is_connected)
+
+        def _ui():
+            try:
+                if self.lbl_status and self.lbl_status.winfo_exists():
+                    self.lbl_status.configure(
+                        text=("Estado: Conectado" if self.connected else "Estado: Desconectado"),
+                        text_color=(OK if self.connected else DANGER)
+                    )
+            except Exception:
+                pass
+            try:
+                if self.chrome and self.chrome.winfo_exists():
+                    self.chrome.set_wifi("Wi-Fi: Conectado" if self.connected else "Wi-Fi: Desconectado")
+            except Exception:
+                pass
+            try:
+                if self.btn_reconnect and self.btn_reconnect.winfo_exists():
+                    self.btn_reconnect.configure(state=("disabled" if self.connected else "normal"))
+            except Exception:
+                pass
+
+        try:
+            self.after(0, _ui)
+        except Exception:
+            _ui()
+
+    def _manual_reconnect(self):
+        if self.connected:
+            return
+        self._reconnect_once(user_initiated=True)
+
+    def _reconnect_once(self, user_initiated: bool = False):
+        if self._reconnect_in_progress:
+            return
+        self._reconnect_in_progress = True
+
+        def worker():
+            try:
+                # cerrar socket viejo si existe
+                try:
+                    if self.sock:
+                        with self.socket_lock:
+                            try:
+                                self.sock.close()
+                            except Exception:
+                                pass
+                finally:
+                    self.sock = None
+                    self.connected = False
+
+                u, pw = self._get_saved_creds()
+                if not u or not pw:
+                    if user_initiated:
+                        self.after(0, lambda: messagebox.showinfo(
+                            "Reconectar", "No hay credenciales guardadas. Volvé a iniciar sesión."
+                        ))
+                    return
+
+                ok = self._connect(DEFAULT_HOST, DEFAULT_PORT)
+                if not ok:
+                    return
+
+                # auth real
+                try:
+                    with self.socket_lock:
+                        self.sock.sendall(f"{u},{pw}".encode("utf-8"))
+                    resp_raw = self.sock.recv(1024).decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    try:
+                        with self.socket_lock:
+                            self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+                    self.connected = False
+                    return
+
+                if not resp_raw.startswith("OK"):
+                    try:
+                        with self.socket_lock:
+                            self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+                    self.connected = False
+                    if user_initiated:
+                        self.after(0, lambda: messagebox.showerror("Reconectar", "Acceso denegado al reconectar."))
+                    return
+
+                self.current_user = u
+                self.current_role = "employee"
+                # ✅ al reconectar, forzamos 1 sync completo
+                self._gcal_force_full_sync_once = True
+
+                # restart listener
+                self._listen_stop.clear()
+                threading.Thread(target=self._listen_loop, daemon=True).start()
+
+                self._set_connection_state(True)
+                if user_initiated:
+                    self.after(0, lambda: messagebox.showinfo("Reconectar", "Conectado nuevamente."))
+
+                # ✅ pedir cfg por si cambió mientras estabas offline
+                self._request_cfg_if_needed()
+
+            finally:
+                self._reconnect_in_progress = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_reconnect_watchdog(self):
+        self._stop_reconnect_watchdog()
+
+        def tick():
+            # reprogramar primero para que nunca se corte
+            try:
+                self._reconnect_after_id = self.after(self._reconnect_interval_ms, tick)
+            except Exception:
+                self._reconnect_after_id = None
+                return
+
+            if not self.connected:
+                self._set_connection_state(False)
+                self._reconnect_once(user_initiated=False)
+
+        self._reconnect_after_id = self.after(self._reconnect_interval_ms, tick)
+
+    def _stop_reconnect_watchdog(self):
+        try:
+            if self._reconnect_after_id:
+                self.after_cancel(self._reconnect_after_id)
+        except Exception:
+            pass
+        self._reconnect_after_id = None
+
+    # =========================
+    # Socket helpers
+    # =========================
+    def _send_line(self, line: str):
+        """
+        Envía una línea terminada en \n (server parsea por readline).
+        """
+        if not line.endswith("\n"):
+            line += "\n"
+        try:
+            if not self.sock:
+                return
+            with self.socket_lock:
+                self.sock.sendall(line.encode("utf-8"))
+        except Exception:
+            pass
+
+    # =========================
+    # ✅ CAPTURAS (AUTO + REMOTO)
+    # =========================
+    def _start_screenshot_scheduler(self):
+        self._stop_screenshot_scheduler()
+
+        def tick():
+            try:
+                self._ss_after_id = self.after(self._ss_interval_ms, tick)
+            except Exception:
+                self._ss_after_id = None
+                return
+
+            if self.connected and self.sock:
+                self._send_screenshot(tag="AUTO")
+
+        self._ss_after_id = self.after(self._ss_interval_ms, tick)
+
+    def _stop_screenshot_scheduler(self):
+        try:
+            if self._ss_after_id:
+                self.after_cancel(self._ss_after_id)
+        except Exception:
+            pass
+        self._ss_after_id = None
+
+    def _send_screenshot(self, tag="MANUAL"):
+        """
+        Protocolo server:
+          SCREENSHOT_DATA|fname|size\n + bytes
+        Este cliente SOLO ENVÍA (no guarda, no descarga).
+        """
+        try:
+            if not self.sock:
+                return
+
+            img = pyautogui.screenshot()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = f"{self.current_user}_{tag}_{ts}.jpg"
+
+            bio = io.BytesIO()
+            img.save(bio, format="JPEG", quality=65)  # un poco más liviano
+            data = bio.getvalue()
+
+            # ✅ opcional: no mandar si no cambió la pantalla
+            if getattr(self, "_ss_only_on_change", False):
+                h = hashlib.sha256(data).hexdigest()
+                if self._ss_last_hash == h:
+                    return
+                self._ss_last_hash = h
+
+            size = len(data)
+
+            header = f"SCREENSHOT_DATA|{fname}|{size}\n".encode("utf-8")
+            with self.socket_lock:
+                self.sock.sendall(header + data)
+
+        except Exception:
+            # no crashear por capturas
+            pass
+
+    # =========================
+    # ✅ ACTIVIDAD V2 (FG/BG)
+    # =========================
+    def _get_foreground_title_windows(self) -> str:
+        """
+        Devuelve título ventana en foco en Windows.
+        Si falla, retorna "".
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            hWnd = user32.GetForegroundWindow()
+            if not hWnd:
+                return ""
+
+            length = user32.GetWindowTextLengthW(hWnd)
+            if length == 0:
+                return ""
+
+            buff = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hWnd, buff, length + 1)
+            title = buff.value or ""
+            title = title.strip()
+            return title
+        except Exception:
+            return ""
+
+    def _safe_app_name_from_title(self, title: str) -> str:
+        """
+        Normaliza para evitar basura:
+        - recorta largo
+        - fallback a 'Sistema'
+        """
+        t = (title or "").strip()
+        if not t:
+            return "Sistema"
+        if len(t) > 80:
+            t = t[:80]
+        return t
+
+    def _activity_tick(self):
+        """
+        Acumula delta local cada 5s:
+          app -> {fg:sec, bg:sec}
+        y luego envía JSON|... al server.
+        """
+        now = time.time()
+        dt = max(0.0, now - float(self._activity_last_ts or now))
+        self._activity_last_ts = now
+
+        # Foreground (real)
+        fg_title = self._get_foreground_title_windows()
+        app = self._safe_app_name_from_title(fg_title)
+
+        if app not in self._activity_delta:
+            self._activity_delta[app] = {"fg": 0.0, "bg": 0.0}
+        self._activity_delta[app]["fg"] = float(self._activity_delta[app].get("fg", 0.0)) + float(dt)
+
+        # Background best-effort (no rompe nada si no hay)
+        # Si querés bg real luego, lo mejor es hacerlo en el cliente KClient “tracker”,
+        # pero acá al menos dejamos el canal funcionando.
+        # self._activity_delta[app]["bg"] += 0.0
+
+        # Enviar y limpiar delta
+        if self.connected and self.sock and self._activity_delta:
+            payload = {
+                "type": "activity_v2",
+                "user": self.current_user,
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "delta": self._activity_delta
+            }
+            try:
+                self._send_line("JSON|" + json.dumps(payload, ensure_ascii=False))
+                self._activity_delta = {}
+            except Exception:
+                pass
+
+    def _start_activity_loop(self):
+        self._stop_activity_loop()
+        self._activity_last_ts = time.time()
+
+        def tick():
+            try:
+                self._activity_after_id = self.after(self._activity_tick_ms, tick)
+            except Exception:
+                self._activity_after_id = None
+                return
+
+            try:
+                self._activity_tick()
+            except Exception:
+                pass
+
+        self._activity_after_id = self.after(self._activity_tick_ms, tick)
+
+    def _stop_activity_loop(self):
+        try:
+            if self._activity_after_id:
+                self.after_cancel(self._activity_after_id)
+        except Exception:
+            pass
+        self._activity_after_id = None
+
+    # =========================
+    # ✅ CFG ocio (version)
+    # =========================
+    def _request_cfg_if_needed(self):
+        # Server: CFG_VERSION|<int>  (responde DISTRACTION_CFG si server_version > client_version)
+        try:
+            self._send_line(f"CFG_VERSION|{int(self._cfg_version or 0)}")
+        except Exception:
+            pass
+
+    # =========================
+    # ✅ Keepalive
+    # =========================
+    def _start_keepalive(self):
+        self._stop_keepalive()
+
+        def tick():
+            try:
+                self._keepalive_after_id = self.after(self._keepalive_ms, tick)
+            except Exception:
+                self._keepalive_after_id = None
+                return
+
+            if self.connected and self.sock:
+                self._send_line("ALIVE_PING")
+                # también pedimos cfg cada cierto tiempo (barato)
+                self._request_cfg_if_needed()
+
+        self._keepalive_after_id = self.after(self._keepalive_ms, tick)
+
+    def _stop_keepalive(self):
+        try:
+            if self._keepalive_after_id:
+                self.after_cancel(self._keepalive_after_id)
+        except Exception:
+            pass
+        self._keepalive_after_id = None
+
+    # =========================
+    # Listener
+    # =========================
+    def _readline_from_buffer(self, buf: bytearray):
+        idx = buf.find(b"\n")
+        if idx == -1:
+            return None
+        line = bytes(buf[:idx])
+        del buf[:idx + 1]
+        return line
+
+    def _handle_server_line(self, msg: str):
+        if not msg:
+            return
+
+        # ✅ popup
+        if msg.startswith("SHOW_POPUP|"):
+            txt = msg.split("|", 1)[1]
+            self.after(0, lambda: messagebox.showinfo("Mensaje", txt))
+            return
+
+        # ✅ server pide captura
+        if msg.startswith("TAKE_SCREENSHOT|"):
+            tag = msg.split("|", 1)[1].strip() or "MANUAL"
+            threading.Thread(target=self._send_screenshot, args=(tag,), daemon=True).start()
+            return
+
+        # ✅ config ocio
+        if msg.startswith("DISTRACTION_CFG|"):
+            raw = msg.split("|", 1)[1].strip()
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict) and data.get("type") == "distraction_cfg":
+                    self._cfg_version = int(data.get("version", 0) or 0)
+                    kws = data.get("keywords", [])
+                    self._cfg_keywords = kws if isinstance(kws, list) else []
+            except Exception:
+                pass
+            return
+
+        # (Opcional) server puede mandar USER_LIST|... aunque empleado no lo use
+        if msg.startswith("USER_LIST|"):
+            return
+
+        # PONG (wifi) / otros
+        if msg == "PONG":
+            return
+
+        # Debug
+        print(msg)
+
+    def _listen_loop(self):
+        """
+        Listener robusto por líneas.
+        NO procesa PHOTO_DATA (este cliente NO descarga/recibe fotos).
+        """
+        while not self._listen_stop.is_set():
+            try:
+                if not self.sock:
+                    time.sleep(0.3)
+                    continue
+
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("Socket cerrado por el servidor")
+
+                self._recv_buf.extend(chunk)
+
+                while True:
+                    line = self._readline_from_buffer(self._recv_buf)
+                    if line is None:
+                        break
+                    msg = line.decode("utf-8", errors="ignore").strip()
+
+                    # ignorar vacíos
+                    if not msg or msg == "\x00":
+                        continue
+
+                    # si el server enviara bytes de PHOTO_DATA (no debería al empleado),
+                    # esto evita romper (no hacemos nada).
+                    if msg.startswith("PHOTO_DATA|"):
+                        # header PHOTO_DATA|name|size  -> ignoramos (cliente no descarga)
+                        continue
+
+                    self._handle_server_line(msg)
+
+            except Exception:
+                # marcar desconexión y salir; watchdog intenta reconectar
+                self.connected = False
+                self._set_connection_state(False)
+                try:
+                    if self.sock:
+                        with self.socket_lock:
+                            try:
+                                self.sock.close()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                self.sock = None
+                break
+
+    # =========================
+    # UI principal (Tareas como pantalla única)
+    # =========================
+    def _enter_main_ui(self):
+        if self.login_root:
+            self.login_root.destroy()
+            self.login_root = None
+
+        self.chrome = WindowChrome(
+            self,
+            title_left=f"{self.current_user} (Empleado)",
+            wifi_text="Wi-Fi: Conectado" if self.connected else "Wi-Fi: Desconectado",
+            on_close=self._on_close
+        )
+        self.chrome.pack(fill="x", padx=0, pady=0)
+
+        self.main_root = ctk.CTkFrame(self, fg_color=NAVY)
+        self.main_root.pack(fill="both", expand=True)
+        self.main_root.pack_propagate(False)
+
+        topbar = ctk.CTkFrame(self.main_root, fg_color="transparent")
+        topbar.pack(fill="x", padx=14, pady=(12, 8))
+
+        self.btn_reconnect = ctk.CTkButton(
+            topbar, text="Reconectar", width=130, fg_color="#22324a",
+            hover_color="#2b3e5b", command=self._manual_reconnect
+        )
+        self.btn_reconnect.pack(side="right")
+
+        self.lbl_status = ctk.CTkLabel(
+            topbar,
+            text=("Estado: Conectado" if self.connected else "Estado: Desconectado"),
+            text_color=(OK if self.connected else DANGER),
+            font=("Roboto", 11)
+        )
+        self.lbl_status.pack(side="left")
+
+        # ✅ PANTALLA ÚNICA: TasksModule ocupa todo el espacio
+
+
+        # ✅ INCRUSTAR TASKS MODULE COMPARTIDO
+        context = {
+            "role": "employee",
+            "user_id": self.current_user,
+            "visible_users": [self.current_user],
+            "can_view_team": False,
+            "can_assign_tasks": False,
+            "can_reassign_tasks": False,
+            "can_edit_due": False,
+        }
+
+        theme = {
+            "TURQ": TURQ,
+            "NAVY": NAVY,
+            "WHITE": WHITE,
+            "CARD": CARD,
+            "CARD2": CARD2,
+            "MUTED": MUTED,
+            "DANGER": DANGER,
+            "OK": OK,
+        }
+
+        # ✅ BODY con TABVIEW (navbar)
+        body = ctk.CTkFrame(self.main_root, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        tabs = ctk.CTkTabview(
+            body,
+            fg_color="transparent",
+            segmented_button_fg_color=CARD,
+            segmented_button_selected_color=TURQ,
+            segmented_button_selected_hover_color="#12b5aa",
+            segmented_button_unselected_color=CARD2,
+            segmented_button_unselected_hover_color="#1b2a42",
+            text_color=WHITE
+        )
+        tabs.pack(fill="both", expand=True)
+
+        tab_local = tabs.add("Tareas locales")
+        tab_gc = tabs.add("Google Calendar")
+
+        # =========================
+        # TAB 1: TasksModule (igual que antes)
+        # =========================
+        context = {
+            "role": "employee",
+            "user_id": self.current_user,
+            "visible_users": [self.current_user],
+            "can_view_team": False,
+            "can_assign_tasks": False,
+            "can_reassign_tasks": False,
+            "can_edit_due": False,
+        }
+
+        theme = {
+            "TURQ": TURQ,
+            "NAVY": NAVY,
+            "WHITE": WHITE,
+            "CARD": CARD,
+            "CARD2": CARD2,
+            "MUTED": MUTED,
+            "DANGER": DANGER,
+            "OK": OK,
+        }
+
+        self.tasks_view = TasksModule(tab_local, context=context, theme=theme)
+        self.tasks_view.pack(fill="both", expand=True, padx=0, pady=0)
+
+        # =========================
+        # TAB 2: Google Calendar UI
+        # =========================
+        gc_top = ctk.CTkFrame(tab_gc, fg_color="transparent")
+        gc_top.pack(fill="x", padx=8, pady=(10, 8))
+
+        self.gc_status_lbl = ctk.CTkLabel(gc_top, text="Estado: Desconectado", text_color=DANGER, font=("Roboto", 11))
+        self.gc_status_lbl.pack(side="left")
+
+        self.gc_next_run_lbl = ctk.CTkLabel(gc_top, text="Próxima actualización: --:--", text_color=MUTED,
+                                            font=("Roboto", 11))
+        self.gc_next_run_lbl.pack(side="left", padx=(12, 0))
+
+        btns = ctk.CTkFrame(gc_top, fg_color="transparent")
+        btns.pack(side="right")
+
+        ctk.CTkButton(
+            btns, text="Seleccionar archivo", width=160,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=self._gc_select_client_json_file
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btns, text="Guardar JSON pegado", width=160,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=self._gc_save_client_json_text
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btns, text="Conectar", width=120,
+            fg_color=TURQ, text_color="#001013", hover_color="#12b5aa",
+            command=self._gc_connect_flow
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btns, text="Desconectar", width=140,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=self._gc_disconnect
+        ).pack(side="left")
+
+        # Caja para pegar client JSON (opcional)
+        box = ctk.CTkFrame(tab_gc, fg_color=CARD2, corner_radius=14)
+        box.pack(fill="x", padx=8, pady=(0, 10))
+
+        ctk.CTkLabel(box, text="Pegá acá el JSON de credenciales (OAuth Desktop) si querés:",
+                     text_color=MUTED, font=("Roboto", 11)).pack(anchor="w", padx=12, pady=(10, 6))
+
+        self.gc_client_text = ctk.CTkTextbox(box, height=120, fg_color=CARD, text_color=WHITE)
+        self.gc_client_text.pack(fill="x", padx=12, pady=(0, 12))
+
+        # Scroll eventos
+        self.gc_events_scroll = ctk.CTkScrollableFrame(tab_gc, fg_color="transparent")
+        self.gc_events_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # Botón manual refresh
+        footer = ctk.CTkFrame(tab_gc, fg_color="transparent")
+        footer.pack(fill="x", padx=8, pady=(0, 10))
+
+        ctk.CTkButton(
+            footer, text="Actualizar ahora", width=160,
+            fg_color="#22324a", hover_color="#2b3e5b",
+            command=self._gc_refresh_week_events
+        ).pack(side="left")
+
+        # Cargar estado inicial
+        ok = self._gc_load_service()
+        self._gc_update_status_ui(ok)
+        if ok:
+            self._gc_refresh_week_events()
+            self._gc_schedule_hourly_at_minute_10()
+
+        # estado y loops
+        self._set_connection_state(self.connected)
+        self._start_reconnect_watchdog()
+
+        # ✅ pedir cfg al entrar (si hay update en server)
+        self._request_cfg_if_needed()
+
+        # ✅ loops nuevos
+        self._start_keepalive()
+        self._start_activity_loop()
+        self._start_screenshot_scheduler()
+
+    def _on_close(self):
+        try:
+            self._stop_reconnect_watchdog()
+        except Exception:
+            pass
+        try:
+            self._gc_cancel_schedule()
+        except Exception:
+            pass
+
+        # ✅ stop loops nuevos
+        try:
+            self._stop_keepalive()
+        except Exception:
+            pass
+        try:
+            self._stop_activity_loop()
+        except Exception:
+            pass
+        try:
+            self._stop_screenshot_scheduler()
+        except Exception:
+            pass
+
+        try:
+            self._listen_stop.set()
+        except Exception:
+            pass
+
+        try:
+            if self.sock:
+                with self.socket_lock:
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        self.sock = None
+        self.connected = False
+        self.destroy()
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    app = AppEmpleado()
+    app.mainloop()
