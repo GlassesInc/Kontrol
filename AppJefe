@@ -599,11 +599,7 @@ class ScreenshotGallery(ctk.CTkFrame):
                 return True
         except Exception:
             pass
-        try:
-            self.after(0, fn)
-            return True
-        except Exception:
-            return False
+        return False
 
     # ----------------------------
     # Lifecycle
@@ -1781,8 +1777,7 @@ class PerfomanceView(ctk.CTkFrame):
             if hasattr(top, "_enqueue_ui"):
                 top._enqueue_ui(fn)
                 return True
-            self.after(0, fn)
-            return True
+            return False
         except Exception:
             return False
 
@@ -3193,14 +3188,31 @@ class PerfomanceView(ctk.CTkFrame):
         # mensaje "typing" neutro
         self._append_chat("assistant", "Procesando…")
 
+        req_id = int(time.time() * 1000)
+        self._ai_pending_req_id = req_id
+
+        def _watchdog(rid=req_id):
+            try:
+                if getattr(self, "_ai_pending_req_id", None) != rid:
+                    return
+                if self._ai_chat_history and self._ai_chat_history[-1][0] == "assistant" and self._ai_chat_history[-1][1].startswith("Procesando"):
+                    self._ai_chat_history.pop()
+                    self._ai_chat_history.append(("assistant", "La solicitud tardó demasiado. Revisá conexión/API key e intentá nuevamente."))
+                    self._render_ai_chat_history()
+                self._ai_pending_req_id = None
+            except Exception:
+                pass
+
+        self._safe_after_ui(lambda rid=req_id: self.after(45000, lambda: _watchdog(rid)))
+
         import threading
         threading.Thread(
             target=self._ai_chat_worker_pro,
-            args=(q, context),
+            args=(q, context, req_id),
             daemon=True
         ).start()
 
-    def _ai_chat_worker_pro(self, question: str, context: str):
+    def _ai_chat_worker_pro(self, question: str, context: str, req_id: int):
         """
         Igual que tu worker, pero:
         - no devuelve errores crudos
@@ -3252,12 +3264,13 @@ class PerfomanceView(ctk.CTkFrame):
             out_text = "No pude responder en este momento. Probá de nuevo o verificá la configuración de la API."
 
         def ui():
-            # borrar el último "Procesando…" si existe
             try:
-                if self._ai_chat_history and self._ai_chat_history[-1][0] == "assistant" and self._ai_chat_history[-1][
-                    1].startswith("Procesando"):
+                if getattr(self, "_ai_pending_req_id", None) not in (None, req_id):
+                    return
+                self._ai_pending_req_id = None
+                if self._ai_chat_history and self._ai_chat_history[-1][0] == "assistant" and self._ai_chat_history[-1][1].startswith("Procesando"):
                     self._ai_chat_history.pop()
-            except:
+            except Exception:
                 pass
 
             self._ai_chat_history.append(("assistant", out_text or "Sin respuesta."))
@@ -3987,7 +4000,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             widget.destroy()
 
         # figura
-        fig, ax = plt.subplots(figsize=(4.2, 2.6), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.2, 2.6), dpi=72)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
 
@@ -4037,7 +4050,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         labels = [a[:32] for a, _ in items]
         hours = [(sec / 3600.0) for _, sec in items]
 
-        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=72)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
         ax.bar(labels, hours, color='#3498db')
@@ -4090,7 +4103,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         self.lbl_added = ctk.CTkLabel(tab, text="Factores: Ninguno")
         self.lbl_added.pack(pady=(0, 6))
 
-        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=72)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
         ax.text(0.5, 0.5, "Añadí factores arriba", color="white", ha="center", va="center")
@@ -4178,7 +4191,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             text_color="white"
         ).pack(side="left", padx=12)
 
-        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=72)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
 
@@ -5745,10 +5758,7 @@ class KClientApp(ctk.CTk):
             except Exception as e:
                 print(f"Widget ya no existe, ignorando actualización: {e}")
 
-        try:
-            self.after(0, ui)
-        except Exception:
-            ui()
+        self._run_on_ui(ui)
 
 
     def _ui_set_loading_user(self, user):
@@ -5768,7 +5778,7 @@ class KClientApp(ctk.CTk):
             self.history_box.see("1.0")  # <-- se queda ARRIBA
             self.history_box.configure(state="disabled")
 
-        self.after(0, ui)
+        self._run_on_ui(ui)
 
     def _touch_stats_block(self):
         self._stats_block_last_ts = time.time()
@@ -5888,7 +5898,7 @@ class KClientApp(ctk.CTk):
         def task():
             ok = self._connect(host, port)
             if not ok:
-                self.after(0, lambda: self.btn_login.configure(state="normal", text="Conectar"))
+                self._run_on_ui(lambda: self.btn_login.configure(state="normal", text="Conectar"))
                 return
 
             # ✅ Protocolo real: "user,pass" y respuesta "OK,..."
@@ -5897,8 +5907,8 @@ class KClientApp(ctk.CTk):
                     self.sock.sendall(f"{u},{pw}".encode("utf-8"))
                 resp_raw = self.sock.recv(1024).decode("utf-8", errors="ignore").strip()
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Error", f"No se pudo loguear: {e}"))
-                self.after(0, lambda: self.btn_login.configure(state="normal", text="Conectar"))
+                self._run_on_ui(lambda: messagebox.showerror("Error", f"No se pudo loguear: {e}"))
+                self._run_on_ui(lambda: self.btn_login.configure(state="normal", text="Conectar"))
                 return
 
             if not resp_raw.startswith("OK"):
@@ -5909,8 +5919,8 @@ class KClientApp(ctk.CTk):
                     pass
                 self.sock = None
                 self.connected = False
-                self.after(0, lambda: messagebox.showerror("Error", "Acceso Denegado"))
-                self.after(0, lambda: self.btn_login.configure(state="normal", text="Conectar"))
+                self._run_on_ui(lambda: messagebox.showerror("Error", "Acceso Denegado"))
+                self._run_on_ui(lambda: self.btn_login.configure(state="normal", text="Conectar"))
                 return
 
             # ✅ Rol (si viene como "OK,<rol>....")
@@ -5925,7 +5935,7 @@ class KClientApp(ctk.CTk):
             self.current_user = u
             self._save_creds(u, pw)
 
-            self.after(0, self._enter_main_ui)
+            self._run_on_ui(self._enter_main_ui)
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -5940,7 +5950,7 @@ class KClientApp(ctk.CTk):
             # ❌ NO arrancar listen_loop todavía
             return True
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Error", f"No se pudo conectar: {e}"))
+            self._run_on_ui(lambda: messagebox.showerror("Error", f"No se pudo conectar: {e}"))
             self.connected = False
             self.sock = None
             return False
@@ -5988,10 +5998,7 @@ class KClientApp(ctk.CTk):
             except Exception:
                 pass
 
-        try:
-            self.after(0, _ui)
-        except Exception:
-            _ui()
+        self._run_on_ui(_ui)
 
     def _manual_reconnect(self):
         """Botón: intenta reconectar ahora."""
@@ -6023,7 +6030,7 @@ class KClientApp(ctk.CTk):
                 u, pw = self._get_saved_creds()
                 if not u or not pw:
                     if user_initiated:
-                        self.after(0, lambda: messagebox.showinfo("Reconectar", "No hay credenciales guardadas. Volvé a iniciar sesión."))
+                        self._run_on_ui(lambda: messagebox.showinfo("Reconectar", "No hay credenciales guardadas. Volvé a iniciar sesión."))
                     return
 
                 ok = self._connect(DEFAULT_HOST, DEFAULT_PORT)
@@ -6055,7 +6062,7 @@ class KClientApp(ctk.CTk):
                     self.sock = None
                     self.connected = False
                     if user_initiated:
-                        self.after(0, lambda: messagebox.showerror("Reconectar", "Acceso denegado al reconectar."))
+                        self._run_on_ui(lambda: messagebox.showerror("Reconectar", "Acceso denegado al reconectar."))
                     return
 
                 parts = resp_raw.split(",")
@@ -6071,11 +6078,11 @@ class KClientApp(ctk.CTk):
                 # UI + refrescos
                 self._set_connection_state(True)
                 try:
-                    self.after(0, lambda: self._request_user_list())
+                    self._run_on_ui(lambda: self._request_user_list())
                 except Exception:
                     pass
                 if user_initiated:
-                    self.after(0, lambda: messagebox.showinfo("Reconectar", "Conectado nuevamente."))
+                    self._run_on_ui(lambda: messagebox.showinfo("Reconectar", "Conectado nuevamente."))
             finally:
                 self._reconnect_in_progress = False
 
@@ -7800,7 +7807,6 @@ class KClientApp(ctk.CTk):
 
                     # 3) Header especial de binario
                     # Formato: PHOTO_DATA|fname|size
-                    print(line_str)
                     # ✅ Respuesta de chat IA (texto)
                     if line_str.startswith("AI_CHAT_RESP|"):
                         self._run_on_ui(lambda l=line_str: self._handle_ai_chat_resp_line(l))
@@ -7874,7 +7880,7 @@ class KClientApp(ctk.CTk):
         # aviso (una sola vez por caída)
         try:
             if (not getattr(self, "_closing", False)) and (not getattr(self, "_reconnect_in_progress", False)):
-                self.after(0, lambda: messagebox.showwarning("Desconectado", "Se perdió la conexión con el servidor."))
+                self._run_on_ui(lambda: messagebox.showwarning("Desconectado", "Se perdió la conexión con el servidor."))
         except Exception:
             pass
         try:
@@ -8037,7 +8043,7 @@ class KClientApp(ctk.CTk):
                 if hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists():
                     self.perf_view.set_users(users)
 
-            self.after(0, ui_update)
+            ui_update()
 
             # refrescar estados: si lista cambia, o si todavía hay usuarios sin estado cargado
             has_missing_status = any(not (self._latest_stats.get(u, {}) or {}).get("status") for u in users)
@@ -8059,7 +8065,7 @@ class KClientApp(ctk.CTk):
             parts = line.split("|", 2)
             title = parts[1] if len(parts) > 1 else "Info"
             msg = parts[2] if len(parts) > 2 else ""
-            self.after(0, lambda: messagebox.showinfo(title, msg))
+            messagebox.showinfo(title, msg)
             return
         if line.startswith("TAKE_SCREENSHOT|"):
             # Server manda:
