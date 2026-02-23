@@ -6392,7 +6392,7 @@ class KClientApp(ctk.CTk):
             day = date.today().isoformat()
         try:
             with self.socket_lock:
-                self.sock.sendall(f"REQUEST_USER_STATS|{user}|{day}\\n".encode("utf-8"))
+                self.sock.sendall(f"REQUEST_USER_STATS|{user}|{day}\n".encode("utf-8"))
                 print(">>> SEND REQUEST_USER_STATS:", f"REQUEST_USER_STATS|{user}|{day}")
         except Exception as e:
             print("request_user_stats error:", e)
@@ -7538,39 +7538,51 @@ class KClientApp(ctk.CTk):
         # ✅ Detectar inicio de bloque USER_STATS
         if line.startswith("USER_STATS|"):
             parts = line.split("|")
-            # El orden enviado por el servidor es: 0:Header, 1:User, 2:Date, 3:Status, 4:Activo, 5:Inactivo, 6:Historial
+            # Formato: USER_STATS|user|date|status|active|inactive|history_escaped
             if len(parts) >= 6:
                 user = parts[1].strip()
                 req_date = parts[2].strip()
-                status = parts[3].strip()  # Aquí debe decir ONLINE u OFFLINE
+                status = parts[3].strip()
                 fg_time = parts[4].strip()
                 bg_time = parts[5].strip()
                 history_raw = parts[6].replace("\\n", "\n") if len(parts) > 6 else ""
 
-                # Actualizar Panel de Empleados (Mini-Cards)
-                if hasattr(self, "employees_panel"):
+                # Cache directo (el server envía una sola línea)
+                if not hasattr(self, "_latest_stats") or self._latest_stats is None:
+                    self._latest_stats = {}
+                self._latest_stats.setdefault(user, {})
+                self._latest_stats[user]["fg_time"] = fg_time
+                self._latest_stats[user]["bg_time"] = bg_time
+                self._latest_stats[user]["status"] = status
+                self._latest_stats[user]["raw"] = history_raw
+                self._append_user_history(user, history_raw)
+
+                # UI: cards + detalle seleccionado
+                if hasattr(self, "employees_panel") and self.employees_panel and self.employees_panel.winfo_exists():
                     color = OK if status == "ONLINE" else DANGER
-                    # Esto corrige que aparezca el nombre "ONLINE" y el color correcto
                     self.employees_panel.set_user_status(user, status, color=color)
 
-                # Si este es el usuario seleccionado, actualizar el detalle y el historial
                 if self.selected_user_var.get() == user:
-                    self.lbl_detail.configure(text=f"Empleado: {user} | Fecha: {req_date}\nEstado: {status}")
+                    try:
+                        self.lbl_detail.configure(text=f"Empleado: {user} | Fecha: {req_date}\nEstado: {status}")
+                    except Exception:
+                        pass
                     self._ui_set_history_text(history_raw)
-            self._flush_user_stats_block()
 
-            # ✅ FIX: actualizar selected_day en perf_view si corresponde al usuario activo
-            # (así la UI queda en sintonía con los datos que llegaron)
-            try:
-                if (hasattr(self, "perf_view") and self.perf_view
-                        and self.perf_view.winfo_exists()
-                        and getattr(self.perf_view, "target_user", None) == user
-                        and req_date):
-                    d_obj = datetime.strptime(req_date, "%Y-%m-%d").date()
-                    # sincronizar sin re-disparar request al server
-                    self.after(0, lambda d=d_obj: self.perf_view._set_selected_day(d, notify_server=False))
-            except Exception:
-                pass
+                # Performance abierta para ese usuario
+                try:
+                    if (hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists()
+                            and getattr(self.perf_view, "target_user", None) == user):
+                        self.perf_view.update_data(
+                            active_time_str=fg_time,
+                            inactive_time_str=bg_time,
+                            history_raw=history_raw,
+                        )
+                        if req_date:
+                            d_obj = datetime.strptime(req_date, "%Y-%m-%d").date()
+                            self.after(0, lambda d=d_obj: self.perf_view._set_selected_day(d, notify_server=False))
+                except Exception:
+                    pass
 
             return
 
@@ -7603,8 +7615,9 @@ class KClientApp(ctk.CTk):
 
             self.after(0, ui_update)
 
-            # si querés ignorar duplicados, que solo afecte el auto-refresh, NO la UI
-            if not self._should_ignore_duplicate_user_list(users):
+            # refrescar estados: si lista cambia, o si todavía hay usuarios sin estado cargado
+            has_missing_status = any(not (self._latest_stats.get(u, {}) or {}).get("status") for u in users)
+            if has_missing_status or (not self._should_ignore_duplicate_user_list(users)):
                 self._start_auto_stats_refresh(users)
 
             return
