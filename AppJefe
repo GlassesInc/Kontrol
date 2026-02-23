@@ -1329,8 +1329,10 @@ class PerfomanceView(ctk.CTkFrame):
         self.adv_data = {}   # key -> {"x":[], "y":[]}
 
         self.adv_hours_entry = None
-        self.adv_date_entry = None
         self.adv_btn_start = None
+        self.adv_day_lbl = None
+        self.adv_kpi_mode = "general"  # general | tasks | salary
+        self.adv_kpi_mode_lbl = None
 
         self._adv_tick_job = None
 
@@ -1657,6 +1659,12 @@ class PerfomanceView(ctk.CTkFrame):
             if hasattr(self, "day_label") and self.day_label is not None:
                 try:
                     self.day_label.configure(text=iso)
+                except Exception:
+                    pass
+
+            if hasattr(self, "adv_day_lbl") and self.adv_day_lbl is not None:
+                try:
+                    self.adv_day_lbl.configure(text=f"Fecha seleccionada: {iso}")
                 except Exception:
                     pass
 
@@ -2051,7 +2059,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         right = ctk.CTkFrame(root, fg_color=PANEL, corner_radius=14, border_width=1, border_color=BORDER)
         right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        right.grid_rowconfigure(6, weight=1)
+        right.grid_rowconfigure(8, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
         # ---- header izquierda
@@ -2113,13 +2121,14 @@ class PerfomanceView(ctk.CTkFrame):
         )
         self._adv_totals_lbl.grid(row=0, column=1, sticky="e")
 
-        # Fecha
-        self.adv_date_entry = ctk.CTkEntry(right, placeholder_text="YYYY-MM-DD")
-        self.adv_date_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
-        try:
-            self.adv_date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
-        except:
-            pass
+        # Fecha (usa la fecha global seleccionada en la vista)
+        self.adv_day_lbl = ctk.CTkLabel(
+            right,
+            text=f"Fecha seleccionada: {self.selected_day.isoformat()}",
+            font=("Consolas", 12),
+            text_color="#dbe9ff"
+        )
+        self.adv_day_lbl.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
 
         # Horas/día
         self.adv_hours_entry = ctk.CTkEntry(right, placeholder_text="Horas objetivo del día (8)")
@@ -2158,16 +2167,34 @@ class PerfomanceView(ctk.CTkFrame):
             fg_color="#7f1d1d",
             hover_color="#991b1b",
             command=self._adv_reset_all
-        ).grid(row=6, column=0, sticky="ew", padx=12, pady=(14, 6))
+        ).grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 6))
+
+        mode_row = ctk.CTkFrame(right, fg_color="transparent")
+        mode_row.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 6))
+        mode_row.grid_columnconfigure((0, 1, 2), weight=1)
+        ctk.CTkButton(mode_row, text="KPI (general)", command=lambda: self._adv_set_kpi_mode("general")).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(mode_row, text="Por tareas", command=lambda: self._adv_set_kpi_mode("tasks")).grid(row=0, column=1, sticky="ew", padx=2)
+        ctk.CTkButton(mode_row, text="€ por hora", command=lambda: self._adv_set_kpi_mode("salary")).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        self.adv_kpi_mode_lbl = ctk.CTkLabel(right, text="Modo KPI IA: general", font=("Roboto", 11), text_color="#a9bfd8")
+        self.adv_kpi_mode_lbl.grid(row=5, column=0, sticky="w", padx=12, pady=(0, 6))
+
+        ctk.CTkButton(
+            right,
+            text="Exportar análisis",
+            fg_color="#8e44ad",
+            hover_color="#6d2f8a",
+            command=self._adv_export_analysis
+        ).grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 8))
 
         # Listado usuarios
         ctk.CTkLabel(right, text="Usuarios añadidos", font=("Roboto", 12, "bold"), text_color=TXT).grid(
-            row=4, column=0, sticky="w", padx=12, pady=(8, 4)
+            row=7, column=0, sticky="w", padx=12, pady=(8, 4)
         )
 
         self._adv_users_box = ctk.CTkTextbox(right, height=160, fg_color="#0b111a", text_color="#dbe9ff",
                                              font=("Consolas", 11), corner_radius=12)
-        self._adv_users_box.grid(row=5, column=0, sticky="nsew", padx=12, pady=(0, 10))
+        self._adv_users_box.grid(row=8, column=0, sticky="nsew", padx=12, pady=(0, 10))
         self._adv_refresh_users_box()
 
         # Nota mensual
@@ -2176,7 +2203,7 @@ class PerfomanceView(ctk.CTkFrame):
             text=f"Mes: {self.adv_days_per_month} días · Efectivo = Real / max(KPI, 20%)",
             font=("Roboto", 11),
             text_color=MUT
-        ).grid(row=7, column=0, sticky="w", padx=12, pady=(0, 12))
+        ).grid(row=9, column=0, sticky="w", padx=12, pady=(0, 12))
 
         # si venía corriendo y re-renderizaste el tab, asegurate de redibujar líneas
         self._adv_redraw_all_lines()
@@ -2190,15 +2217,86 @@ class PerfomanceView(ctk.CTkFrame):
 
     def _adv_get_selected_day(self) -> str:
         try:
-            day = (self.adv_date_entry.get() or "").strip()
-            if day:
-                return day
-        except:
+            if isinstance(self.selected_day, date):
+                return self.selected_day.isoformat()
+        except Exception:
             pass
+        return date.today().isoformat()
+
+    def _adv_set_kpi_mode(self, mode: str):
+        mode = (mode or "general").strip().lower()
+        if mode not in ("general", "tasks", "salary"):
+            mode = "general"
+        self.adv_kpi_mode = mode
         try:
-            return datetime.now().strftime("%Y-%m-%d")
-        except:
-            return ""
+            if self.adv_kpi_mode_lbl:
+                txt = {"general": "Modo KPI IA: general", "tasks": "Modo KPI IA: por tareas", "salary": "Modo KPI IA: € por hora estricto"}.get(mode, "Modo KPI IA: general")
+                self.adv_kpi_mode_lbl.configure(text=txt)
+        except Exception:
+            pass
+        self._adv_refresh_users_box()
+        self._adv_redraw_all_lines()
+
+    def _adv_get_user_entry(self, username: str) -> dict:
+        for u in (self.adv_users or []):
+            if (u.get("name") or "").strip() == (username or "").strip():
+                return u
+        return {}
+
+    def _adv_role_alignment_score(self, role_text: str, raw: str) -> int:
+        role = (role_text or "").lower()
+        txt = (raw or "").lower()
+        if not role or not txt:
+            return 70
+        tokens = [t for t in re.split(r"[^a-zA-Záéíóúñ0-9]+", role) if len(t) >= 4]
+        if not tokens:
+            return 70
+        hits = sum(1 for t in tokens if t in txt)
+        ratio = hits / max(1, len(tokens))
+        return int(max(50, min(95, 55 + ratio * 40)))
+
+    def _adv_export_analysis(self):
+        try:
+            export_dir = os.path.join(get_appdata_base_dir(), "exports_analisis")
+            os.makedirs(export_dir, exist_ok=True)
+            day = self._adv_get_selected_day()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = os.path.join(export_dir, f"adv_{day}_{ts}")
+
+            img_path = base + ".png"
+            if self.adv_fig is not None:
+                self.adv_fig.savefig(img_path, dpi=140, bbox_inches="tight")
+
+            lines = [f"Fecha seleccionada: {day}", f"Modo KPI IA: {self.adv_kpi_mode}", "", "Usuarios:"]
+            for u in (self.adv_users or []):
+                real_s, eff_s, kpi_pct = self._adv_user_cost_per_sec(u)
+                lines.append(f"- {u.get('name')} | rol={u.get('role')} | €/h={u.get('eur_per_hour')} | KPI={kpi_pct}% | real={real_s:.4f} | eff={eff_s:.4f}")
+
+            summary = "Resumen IA: comportamiento dentro de lo esperable para la jornada. Revisar desvíos si la línea efectiva crece muy por encima de la real."
+            try:
+                from openai import OpenAI
+                client = OpenAI()
+                prompt = "\n".join(lines) + "\n\nDescribe en 4-6 líneas si la gráfica es normal/esperable y qué mejorar."
+                resp = client.responses.create(model="gpt-4o-mini", input=[{"role":"user","content":prompt}])
+                out = ""
+                for item in getattr(resp, "output", []) or []:
+                    if getattr(item, "type", None) == "message":
+                        for c in getattr(item, "content", []) or []:
+                            if getattr(c, "type", None) in ("output_text", "text"):
+                                out += getattr(c, "text", "")
+                if (out or "").strip():
+                    summary = out.strip()
+            except Exception:
+                pass
+
+            txt_path = base + ".txt"
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+                f.write("\n\n" + summary + "\n")
+
+            messagebox.showinfo("Exportación", f"Análisis exportado:\n{img_path}\n{txt_path}")
+        except Exception as e:
+            messagebox.showerror("Exportación", f"No se pudo exportar análisis: {e}")
 
     def _adv_reset_all(self):
         from tkinter import messagebox
@@ -2367,16 +2465,26 @@ class PerfomanceView(ctk.CTkFrame):
                 "Respondé SOLO un número entero (sin texto extra).\n"
             )
 
+            user_obj = self._adv_get_user_entry(username)
+            role_txt = (user_obj.get("role") or "") if isinstance(user_obj, dict) else ""
+            eur_h = float((user_obj.get("eur_per_hour") or 0.0) if isinstance(user_obj, dict) else 0.0)
+            mode = (self.adv_kpi_mode or "general").lower()
+
             user_prompt = (
                 f"Usuario: {username}\n"
-                f"Fecha: {day}\n\n"
+                f"Fecha: {day}\n"
+                f"Modo KPI: {mode}\n"
+                f"Rol/Tareas esperadas: {role_txt}\n"
+                f"Pago por hora: {eur_h:.2f} €/h\n\n"
                 "Historial RAW:\n"
                 f"{raw}\n\n"
                 "Criterio:\n"
-                "- 100 = foco y tareas claramente productivas casi todo el tiempo.\n"
+                "- No des 100, nadie es perfecto. Máximo 98.\n"
+                "- En modo 'tasks', premiar alineación con rol/tareas y castigar desvíos.\n"
+                "- En modo 'salary', ser más estricto cuanto mayor sea €/h.\n"
                 "- 50 = mezcla fuerte de productivo y ocio/dispersión.\n"
                 "- 20 = muy poco productivo.\n"
-                "Devolvé SOLO el número entero 1..100.\n"
+                "Devolvé SOLO el número entero 1..98.\n"
             )
 
             resp = client.responses.create(
@@ -2405,8 +2513,8 @@ class PerfomanceView(ctk.CTkFrame):
             score = 80
         if score < 1:
             score = 1
-        if score > 100:
-            score = 100
+        if score > 98:
+            score = 98
 
         def ui():
             for u in self.adv_users:
@@ -2719,38 +2827,57 @@ class PerfomanceView(ctk.CTkFrame):
         self._adv_refresh_totals()
 
     def _adv_get_user_kpi(self, username: str) -> float:
-        """
-        KPI como ratio 0..1.
-        - Si el usuario es el target_user actual: calcula desde self.history_raw (FOCO).
-        - Si está en all_users_stats y trae 'raw': calcula desde ese raw.
-        - Si no hay datos: fallback 0.80
-        """
-        # 1) si es el usuario actual
+        """KPI 0..1 basado en modo seleccionado. Nunca devuelve 100% exacto."""
+        base_ratio = 0.80
+
+        # KPI foco base desde raw/historial
         try:
             if (username or "").strip() == (self.target_user or "").strip():
                 stats = self.get_categorized_data()
                 total = stats["Productivo"] + stats["Ocio"]
                 if total > 0:
-                    return max(0.0, min(1.0, stats["Productivo"] / total))
-        except:
+                    base_ratio = max(0.0, min(1.0, stats["Productivo"] / total))
+            else:
+                for u in (self.all_users_stats or []):
+                    if not isinstance(u, dict):
+                        continue
+                    name = u.get("name") or u.get("user") or u.get("username")
+                    if (name or "").strip() != (username or "").strip():
+                        continue
+                    raw = u.get("raw")
+                    if isinstance(raw, str) and raw.strip():
+                        kpi_pct = int(self._compute_kpi_from_raw_block(raw) or 80)
+                        base_ratio = max(0.0, min(1.0, kpi_pct / 100.0))
+                    break
+        except Exception:
             pass
 
-        # 2) buscar en all_users_stats raw
-        try:
-            for u in (self.all_users_stats or []):
-                if not isinstance(u, dict):
-                    continue
-                name = u.get("name") or u.get("user") or u.get("username")
-                if (name or "").strip() != (username or "").strip():
-                    continue
-                raw = u.get("raw")
-                if isinstance(raw, str) and raw.strip():
-                    kpi_pct = int(self._compute_kpi_from_raw_block(raw) or 0)
-                    return max(0.0, min(1.0, kpi_pct / 100.0))
-        except:
-            pass
+        u = self._adv_get_user_entry(username)
+        day = self._adv_get_selected_day()
+        ai_eff = u.get("ai_eff") if isinstance(u, dict) else None
+        ai_day = u.get("ai_eff_day") if isinstance(u, dict) else None
+        if ai_eff is None or ai_day != day:
+            self._adv_request_ai_efficiency_async(username)
+            ai_eff = 80
+        ai_ratio = max(0.01, min(0.98, float(ai_eff) / 100.0))
 
-        return 0.80
+        mode = (self.adv_kpi_mode or "general").lower()
+        raw = self._adv_get_user_raw_for_ai(username)
+
+        if mode == "tasks":
+            role_score = self._adv_role_alignment_score((u.get("role") if isinstance(u, dict) else ""), raw)
+            role_ratio = role_score / 100.0
+            out = (base_ratio * 0.45) + (ai_ratio * 0.35) + (role_ratio * 0.20)
+        elif mode == "salary":
+            eur_h = float((u.get("eur_per_hour") if isinstance(u, dict) else 0.0) or 0.0)
+            strict_target = min(0.95, 0.68 + (eur_h / 200.0))
+            penalty = max(0.0, strict_target - base_ratio)
+            out = (base_ratio * 0.55) + (ai_ratio * 0.45) - (penalty * 0.35)
+        else:
+            out = (base_ratio * 0.60) + (ai_ratio * 0.40)
+
+        # nunca 100% perfecto
+        return max(0.20, min(0.98, out))
 
     def _render_ai_chat_history(self):
         if not hasattr(self, "_ai_chat_scroll") or not self._ai_chat_scroll:
