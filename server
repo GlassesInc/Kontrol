@@ -803,6 +803,26 @@ class TerminalServer:
         except:
             return {}
 
+    def _read_activity_day_with_fallback(self, user: str, day: str):
+        """Devuelve (used_day, data) con fallback ±1 día para desfases de zona horaria."""
+        req = (day or "").strip()
+        data = self._read_activity_day(user, req)
+        if data:
+            return req, data
+
+        try:
+            base = datetime.strptime(req, "%Y-%m-%d")
+        except Exception:
+            return req, {}
+
+        for delta in (-1, 1):
+            alt_day = (base + timedelta(days=delta)).strftime("%Y-%m-%d")
+            alt = self._read_activity_day(user, alt_day)
+            if alt:
+                return alt_day, alt
+
+        return req, {}
+
     def _ss_tick_and_decide(self, user: str):
         """
         Devuelve (should_save, should_forward)
@@ -2309,7 +2329,7 @@ class TerminalServer:
                             t_act, t_ina = self.get_persisted_times(target)
 
                             # Leer actividad del día solicitado específicamente
-                            day_data = self._read_activity_day(target, req_day)
+                            used_day, day_data = self._read_activity_day_with_fallback(target, req_day)
                             if day_data:
                                 hist = self._format_activity_day_as_hist(day_data, top_n=10)
                             else:
@@ -2321,7 +2341,7 @@ class TerminalServer:
                             try:
                                 # Enviar respuesta con la fecha confirmada
                                 connwrap.sendall(
-                                    f"USER_STATS|{target}|{req_day}|{is_on}|{t_act}|{t_ina}|{hist_escaped}\n".encode(
+                                    f"USER_STATS|{target}|{used_day}|{is_on}|{t_act}|{t_ina}|{hist_escaped}\n".encode(
                                         "utf-8"))
                             except Exception as e:
                                 self.log_to_console(f"Error enviando stats: {e}", "ERR")
