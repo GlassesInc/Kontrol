@@ -5243,20 +5243,24 @@ class KClientApp(ctk.CTk):
         )
         return line.startswith(prefixes)
 
-    def _request_user_stats_throttled(self, user: str):
+    def _request_user_stats_throttled(self, user: str, day: str = None):
         user = (user or "").strip()
         if not user:
             return
         if not getattr(self, "sock", None) or not getattr(self, "connected", False):
             return
 
+        if not day:
+            day = date.today().isoformat()
+        key = f"{user}|{day}"
+
         now = time.time()
-        last = self._stats_req_last.get(user, 0.0)
+        last = self._stats_req_last.get(key, 0.0)
         if (now - last) < self._stats_req_min_interval:
             return
 
-        self._stats_req_last[user] = now
-        self._request_user_stats(user)
+        self._stats_req_last[key] = now
+        self._request_user_stats(user, day=day)
 
     def _start_auto_stats_refresh(self, users: List[str]):
         users = [u.strip() for u in (users or []) if u and u.strip()]
@@ -5276,7 +5280,7 @@ class KClientApp(ctk.CTk):
             for u in users:
                 if stop_evt.is_set():
                     return
-                self._request_user_stats_throttled(u)
+                self._request_user_stats_throttled(u, day=self._get_selected_day_for_requests())
                 time.sleep(self._stats_request_cooldown)
 
         def worker():
@@ -7573,7 +7577,7 @@ class KClientApp(ctk.CTk):
                 except Exception:
                     pass
 
-            parts = line.split("|")
+            parts = line.split("|", 6)
             # Formato: USER_STATS|user|date|status|active|inactive|history_escaped
             if len(parts) >= 6:
                 user = parts[1].strip()

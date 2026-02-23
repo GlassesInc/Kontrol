@@ -1549,6 +1549,13 @@ class TerminalServer:
         fg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
         bg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
 
+        if isinstance(top_n, int) and top_n > 0:
+            fg_rows = fg_sorted[:top_n]
+            bg_rows = bg_sorted[:top_n]
+        else:
+            fg_rows = fg_sorted
+            bg_rows = bg_sorted
+
         def fmt(sec: float):
             try:
                 sec = int(sec)
@@ -1564,12 +1571,12 @@ class TerminalServer:
         out = "\n"
         out += "TOP FOREGROUND (en foco)\n"
         out += "-" * 28 + "\n"
-        for app, v in fg_sorted[:top_n]:
+        for app, v in fg_rows:
             out += f" > {app[:35]:<35} [{fmt(v.get('fg', 0.0))}]\n"
 
         out += "\nTOP BACKGROUND (abierta)\n"
         out += "-" * 28 + "\n"
-        for app, v in bg_sorted[:top_n]:
+        for app, v in bg_rows:
             out += f" > {app[:35]:<35} [{fmt(v.get('bg', 0.0))}]\n"
 
         return out
@@ -2360,7 +2367,7 @@ class TerminalServer:
                             # Leer actividad del día solicitado específicamente
                             used_day, day_data = self._read_activity_day_with_fallback(target, req_day)
                             if day_data:
-                                hist = self._format_activity_day_as_hist(day_data, top_n=10)
+                                hist = self._format_activity_day_as_hist(day_data, top_n=0)
                             else:
                                 hist = f"(sin datos para {req_day})"
 
@@ -2505,15 +2512,22 @@ class TerminalServer:
         fg_sorted = sorted(day_data.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
         bg_sorted = sorted(day_data.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
 
+        if isinstance(top_n, int) and top_n > 0:
+            fg_rows = fg_sorted[:top_n]
+            bg_rows = bg_sorted[:top_n]
+        else:
+            fg_rows = fg_sorted
+            bg_rows = bg_sorted
+
         out = "\n"
         out += "TOP FOREGROUND (en foco)\n"
         out += "-" * 28 + "\n"
-        for app, v in fg_sorted[:top_n]:
+        for app, v in fg_rows:
             out += f" > {app[:35]:<35} [{fmt(v.get('fg', 0.0))}]\n"
 
         out += "\nTOP BACKGROUND (abierta)\n"
         out += "-" * 28 + "\n"
-        for app, v in bg_sorted[:top_n]:
+        for app, v in bg_rows:
             out += f" > {app[:35]:<35} [{fmt(v.get('bg', 0.0))}]\n"
 
         return out
@@ -2648,6 +2662,13 @@ class TerminalServer:
         fg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
         bg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
 
+        if isinstance(top_n, int) and top_n > 0:
+            fg_rows = fg_sorted[:top_n]
+            bg_rows = bg_sorted[:top_n]
+        else:
+            fg_rows = fg_sorted
+            bg_rows = bg_sorted
+
         # timeline (si existe V1 legacy)
         timeline = []
         legacy_path = os.path.join(self.db_dir, f"{user}.txt")
@@ -2673,12 +2694,12 @@ class TerminalServer:
         out.append("-" * 86)
 
         out.append("TOP FOREGROUND (FG)")
-        for app, v in fg_sorted[:top_n]:
+        for app, v in fg_rows:
             out.append(f"  > {app[:45]:<45}  {self._format_seconds_hm(int(float(v.get('fg', 0.0))))}")
 
         out.append("")
         out.append("TOP BACKGROUND (BG)")
-        for app, v in bg_sorted[:top_n]:
+        for app, v in bg_rows:
             out.append(f"  > {app[:45]:<45}  {self._format_seconds_hm(int(float(v.get('bg', 0.0))))}")
 
         out.append("-" * 86)
