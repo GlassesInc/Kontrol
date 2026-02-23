@@ -780,7 +780,7 @@ class TerminalServer:
                 self.log_to_console(f"AI worker error: {e}", "ERR")
 
     def _list_activity_dates(self, user: str) -> list:
-        user_dir = os.path.join(self.activity_dir, user)
+        user_dir = os.path.join(self.activity_dir, self._resolve_activity_user(user))
         if not os.path.isdir(user_dir):
             return []
         dates = []
@@ -794,7 +794,7 @@ class TerminalServer:
 
     def _read_activity_day(self, user: str, day: str) -> dict:
         # Ruta al JSON (ej: basededatos/activity/usuario/2024-02-18.json)
-        path = os.path.join(self.activity_dir, user, f"{day}.json")
+        path = self._activity_day_path(user, day, create_dir=False)
         if not os.path.exists(path):
             return {}
         try:
@@ -1406,9 +1406,28 @@ class TerminalServer:
     def _day_str_now(self):
         return datetime.now().strftime("%Y-%m-%d")
 
-    def _activity_day_path(self, user: str, day_str: str):
-        user_dir = os.path.join(self.activity_dir, user)
-        ensure_dir(user_dir)
+    def _resolve_activity_user(self, user: str) -> str:
+        """Devuelve el nombre de carpeta real para actividad (case-insensitive)."""
+        user = (user or "").strip()
+        if not user:
+            return user
+        exact = os.path.join(self.activity_dir, user)
+        if os.path.isdir(exact):
+            return user
+        try:
+            lu = user.lower()
+            for d in os.listdir(self.activity_dir):
+                if d.lower() == lu and os.path.isdir(os.path.join(self.activity_dir, d)):
+                    return d
+        except Exception:
+            pass
+        return user
+
+    def _activity_day_path(self, user: str, day_str: str, *, create_dir: bool = True):
+        resolved_user = self._resolve_activity_user(user)
+        user_dir = os.path.join(self.activity_dir, resolved_user)
+        if create_dir:
+            ensure_dir(user_dir)
         return os.path.join(user_dir, f"{day_str}.json")
 
     def _load_activity_day(self, path: str) -> dict:
@@ -1454,7 +1473,7 @@ class TerminalServer:
 
     def ingest_activity_v2(self, user: str, payload: dict):
         day_str = self._day_str_now()
-        path = self._activity_day_path(user, day_str)
+        path = self._activity_day_path(user, day_str, create_dir=True)
 
         delta = payload.get("delta", {})
         with self.file_lock:
@@ -1466,7 +1485,7 @@ class TerminalServer:
         day_str = self._day_str_now()
         with self.file_lock:
             for user in list(self.user_pass_cache.keys()):
-                p = self._activity_day_path(user, day_str)
+                p = self._activity_day_path(user, day_str, create_dir=True)
                 if not os.path.exists(p):
                     self._save_json_atomic(p, {})
 
@@ -1477,7 +1496,7 @@ class TerminalServer:
         total = {}
         for i in range(max(1, int(days))):
             day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
-            path = self._activity_day_path(user, day)
+            path = self._activity_day_path(user, day, create_dir=False)
             day_data = self._load_activity_day(path)
             self._merge_activity_delta(total, day_data)
         return total
