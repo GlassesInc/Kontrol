@@ -13,6 +13,7 @@ import shutil
 import random
 import re
 import sys
+import queue
 from datetime import datetime, timedelta, date
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -590,6 +591,20 @@ class ScreenshotGallery(ctk.CTkFrame):
         except Exception:
             return
 
+    def _post_ui(self, fn):
+        try:
+            top = self.winfo_toplevel()
+            if hasattr(top, "_enqueue_ui"):
+                top._enqueue_ui(fn)
+                return True
+        except Exception:
+            pass
+        try:
+            self.after(0, fn)
+            return True
+        except Exception:
+            return False
+
     # ----------------------------
     # Lifecycle
     # ----------------------------
@@ -635,10 +650,10 @@ class ScreenshotGallery(ctk.CTkFrame):
                 self.load_local_filenames(local_gen)
 
                 # Si el server tarda, igual no queda “en blanco”
-                self.after(0, lambda g=local_gen: self._set_status("Esperando SCREENSHOT_LIST…", g))
+                self._post_ui(lambda g=local_gen: self._set_status("Esperando SCREENSHOT_LIST…", g))
             except Exception as e:
                 print("sync error:", e)
-                self.after(0, lambda g=local_gen: self._set_status(f"Error sync: {e}", g))
+                self._post_ui(lambda g=local_gen: self._set_status(f"Error sync: {e}", g))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -655,12 +670,12 @@ class ScreenshotGallery(ctk.CTkFrame):
             self.all_filenames = list(merged)
 
             # status
-            self.after(0, lambda g=gen: self._set_status(
+            self._post_ui(lambda g=gen: self._set_status(
                 f"Local: {len(files)} • Server: {len(self.server_filenames)} • Total: {len(self.all_filenames)}",
                 g
             ))
 
-            self.after(0, self.apply_filter)
+            self._post_ui(self.apply_filter)
         except Exception as e:
             print("load_local_filenames:", e)
 
@@ -680,11 +695,11 @@ class ScreenshotGallery(ctk.CTkFrame):
         merged.update(self.server_filenames)
         self.all_filenames = list(merged)
 
-        self.after(0, lambda g=gen: self._set_status(
+        self._post_ui(lambda g=gen: self._set_status(
             f"Lista recibida • Local: {len(local_set)} • Server: {len(self.server_filenames)} • Total: {len(self.all_filenames)}",
             g
         ))
-        self.after(0, self.apply_filter)
+        self._post_ui(self.apply_filter)
 
         # Pedir faltantes (SYNC_CHECK) para que el server empuje PHOTO_DATA
         try:
@@ -842,13 +857,13 @@ class ScreenshotGallery(ctk.CTkFrame):
                         with self.socket_lock:
                             self.sock.sendall(f"DOWNLOAD_PHOTO|{filename}\n".encode("utf-8"))
                     except Exception as e:
-                        self.after(0, lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, f"Error pidiendo foto: {e}", g))
+                        self._post_ui(lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, f"Error pidiendo foto: {e}", g))
                         return
 
                 # 2) esperar a que aparezca y se estabilice
                 if not self.wait_file_stable(local_path, checks=6, delay=0.25):
                     # no llegó: mostrar estado (sin crash)
-                    self.after(0, lambda lw=lbl_widget, g=gen: self._set_text_safe(
+                    self._post_ui(lambda lw=lbl_widget, g=gen: self._set_text_safe(
                         lw, "Pendiente de descarga… (si no baja, revisá PHOTO_DATA en listen_loop)", g
                     ))
                     return
@@ -858,15 +873,15 @@ class ScreenshotGallery(ctk.CTkFrame):
                 img = Image.open(local_path)
                 img.load()
             except Exception:
-                self.after(0, lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, "Archivo de imagen inválido", g))
+                self._post_ui(lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, "Archivo de imagen inválido", g))
                 return
 
             img.thumbnail((820, 420))
             img = img.copy()
-            self.after(0, lambda lw=lbl_widget, im=img, g=gen: self._set_pil_img_safe(lw, im, g))
+            self._post_ui(lambda lw=lbl_widget, im=img, g=gen: self._set_pil_img_safe(lw, im, g))
 
         except Exception as e:
-            self.after(0, lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, f"Error: {e}", g))
+            self._post_ui(lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, f"Error: {e}", g))
 
     @staticmethod
     def wait_file_stable(p, checks=6, delay=0.25):
@@ -1762,6 +1777,10 @@ class PerfomanceView(ctk.CTkFrame):
         try:
             if not self.winfo_exists():
                 return False
+            top = self.winfo_toplevel()
+            if hasattr(top, "_enqueue_ui"):
+                top._enqueue_ui(fn)
+                return True
             self.after(0, fn)
             return True
         except Exception:
@@ -3968,7 +3987,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             widget.destroy()
 
         # figura
-        fig, ax = plt.subplots(figsize=(5.0, 3.1), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.2, 2.6), dpi=100)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
 
@@ -3985,7 +4004,8 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
                 colors=['#2ecc71', '#e74c3c'],
                 textprops={'color': "w", 'weight': 'bold'},
                 startangle=90,
-                explode=(0.05, 0)
+                explode=(0.03, 0),
+                radius=0.72
             )
         ax.set_title("PROPORCIÓN DE ACTIVIDAD", color='white', pad=20, fontweight='bold')
 
@@ -4017,7 +4037,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         labels = [a[:32] for a, _ in items]
         hours = [(sec / 3600.0) for _, sec in items]
 
-        fig, ax = plt.subplots(figsize=(5.2, 3.2), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=100)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
         ax.bar(labels, hours, color='#3498db')
@@ -4070,7 +4090,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         self.lbl_added = ctk.CTkLabel(tab, text="Factores: Ninguno")
         self.lbl_added.pack(pady=(0, 6))
 
-        fig, ax = plt.subplots(figsize=(5.2, 3.2), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=100)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
         ax.text(0.5, 0.5, "Añadí factores arriba", color="white", ha="center", va="center")
@@ -4158,7 +4178,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             text_color="white"
         ).pack(side="left", padx=12)
 
-        fig, ax = plt.subplots(figsize=(5.2, 3.2), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=100)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
 
@@ -4173,7 +4193,8 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
                 colors=['#2ecc71', '#e74c3c'],
                 textprops={'color': "w"},
                 startangle=90,
-                wedgeprops=dict(width=0.4)
+                radius=0.78,
+                wedgeprops=dict(width=0.32)
             )
         ax.set_title("CALIDAD DE TRABAJO (KPI - FOCO)", color="white")
 
@@ -5134,6 +5155,8 @@ class KClientApp(ctk.CTk):
         self.send_lock = threading.Lock()  # ✅ este va acá
         self.sock: Optional[socket.socket] = None
         self.connected = False
+        self._ui_queue = queue.Queue()
+        self._ui_pump_after_id = None
 
         # =========================
         # Auto-reconexión (cliente jefe)
@@ -5209,16 +5232,54 @@ class KClientApp(ctk.CTk):
         # UI Login + autologin
         # =========================
         self._build_login()
+        self._ui_pump_after_id = self.after(25, self._pump_ui_queue)
         self.after(350, self._try_autologin)
 
-    def _run_on_ui(self, fn, delay_ms: int = 0) -> bool:
+    def _enqueue_ui(self, fn):
         try:
             if getattr(self, "_closing", False):
                 return False
-            if not self.winfo_exists():
-                return False
-            self.after(max(0, int(delay_ms)), fn)
+            self._ui_queue.put_nowait(fn)
             return True
+        except Exception:
+            return False
+
+    def _pump_ui_queue(self):
+        self._ui_pump_after_id = None
+        try:
+            if getattr(self, "_closing", False) or not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        try:
+            for _ in range(80):
+                try:
+                    fn = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn()
+                except Exception as e:
+                    print("ui_queue fn error:", e)
+        except Exception:
+            pass
+
+        try:
+            self._ui_pump_after_id = self.after(25, self._pump_ui_queue)
+        except Exception:
+            self._ui_pump_after_id = None
+
+    def _run_on_ui(self, fn, delay_ms: int = 0) -> bool:
+        try:
+            if delay_ms and int(delay_ms) > 0:
+                ms = int(delay_ms)
+                def delayed():
+                    time.sleep(ms / 1000.0)
+                    self._enqueue_ui(fn)
+                threading.Thread(target=delayed, daemon=True).start()
+                return True
+            return self._enqueue_ui(fn)
         except Exception:
             return False
 
