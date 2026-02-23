@@ -2150,7 +2150,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         self.adv_btn_start = ctk.CTkButton(
             btn_row,
-            text="EMPEZAR",
+            text="CALCULAR",
             fg_color=ACC,
             text_color="#001013",
             hover_color="#14bdb1",
@@ -2268,12 +2268,15 @@ class PerfomanceView(ctk.CTkFrame):
                 real_s, eff_s, kpi_pct = self._adv_user_cost_per_sec(u)
                 lines.append(f"- {u.get('name')} | rol={u.get('role')} | €/h={u.get('eur_per_hour')} | KPI={kpi_pct}% | real={real_s:.4f} | eff={eff_s:.4f}")
 
-            summary = "Resumen IA: comportamiento dentro de lo esperable para la jornada. Revisar desvíos si la línea efectiva crece muy por encima de la real."
+            summary = "Resumen: comportamiento dentro de lo esperable para la jornada. Revisar desvíos si la línea efectiva crece muy por encima de la real."
             try:
-                from openai import OpenAI
-                client = OpenAI()
-                prompt = "\n".join(lines) + "\n\nDescribe en 4-6 líneas si la gráfica es normal/esperable y qué mejorar."
-                resp = client.responses.create(model="gpt-4o-mini", input=[{"role":"user","content":prompt}])
+                if os.getenv("OPENAI_API_KEY"):
+                    from openai import OpenAI
+                    client = OpenAI(timeout=20)
+                    prompt = "\n".join(lines) + "\n\nDescribe en 4-6 líneas si la gráfica es normal/esperable y qué mejorar."
+                    resp = client.responses.create(model="gpt-4o-mini", input=[{"role":"user","content":prompt}])
+                else:
+                    resp = None
                 out = ""
                 for item in getattr(resp, "output", []) or []:
                     if getattr(item, "type", None) == "message":
@@ -2698,58 +2701,71 @@ class PerfomanceView(ctk.CTkFrame):
         self.adv_ax.set_ylim(0, ymax * 1.12)
 
     def _adv_start_stop(self):
-        # toggle
-        if self.adv_running:
-            self.adv_running = False
-            try:
-                if self.adv_btn_start:
-                    self.adv_btn_start.configure(text="EMPEZAR")
-            except:
-                pass
-            # cancelar job
-            try:
-                if self._adv_tick_job:
-                    self.after_cancel(self._adv_tick_job)
-                    self._adv_tick_job = None
-            except:
-                pass
-            return
+        """Calcula el resultado del día completo sin animación incremental."""
+        # cancelar loop viejo si existía
+        self.adv_running = False
+        try:
+            if self._adv_tick_job:
+                self.after_cancel(self._adv_tick_job)
+        except Exception:
+            pass
+        self._adv_tick_job = None
 
-        # iniciar: validar horas
         try:
             h = float((self.adv_hours_entry.get() or "8").strip())
             if h <= 0:
                 h = 8.0
-        except:
+        except Exception:
             h = 8.0
 
         self.adv_total_seconds = int(h * 3600)
-        self.adv_seconds = 0
+        self.adv_seconds = self.adv_total_seconds
 
-        # reset series a 0
-        for k in list(self.adv_data.keys()):
-            self.adv_data[k] = {"x": [0], "y": [0.0]}
-            if k in self.adv_lines:
-                self.adv_lines[k].set_data([0], [0.0])
+        if not self.adv_users:
+            return
+
+        # recalcular series completas (2 puntos: inicio y fin)
+        for u in self.adv_users:
+            name = (u.get("name") or "").strip()
+            if not name:
+                continue
+            eur_h = float(u.get("eur_per_hour") or 0.0)
+            cost_sec_real = eur_h / 3600.0
+
+            kpi_ratio = self._adv_get_user_kpi(name)
+            kpi_pct = int(round(kpi_ratio * 100))
+            if kpi_pct < 20:
+                kpi_pct = 20
+            if kpi_pct > 98:
+                kpi_pct = 98
+            ratio = kpi_pct / 100.0
+            cost_sec_eff = cost_sec_real / max(0.2, ratio)
+
+            kr = f"{name}:real"
+            ke = f"{name}:eff"
+
+            final_real = cost_sec_real * self.adv_total_seconds
+            final_eff = cost_sec_eff * self.adv_total_seconds
+
+            self.adv_data[kr] = {"x": [0, self.adv_total_seconds], "y": [0.0, final_real]}
+            self.adv_data[ke] = {"x": [0, self.adv_total_seconds], "y": [0.0, final_eff]}
+
+            if kr in self.adv_lines:
+                self.adv_lines[kr].set_data(self.adv_data[kr]["x"], self.adv_data[kr]["y"])
+            if ke in self.adv_lines:
+                self.adv_lines[ke].set_data(self.adv_data[ke]["x"], self.adv_data[ke]["y"])
 
         self._adv_apply_axes_limits()
         self._adv_autoscale_y()
+        self._adv_refresh_totals()
         if self.adv_canvas:
             self.adv_canvas.draw_idle()
 
-        if not self.adv_users:
-            # no arrancar sin usuarios
-            return
-
-        self.adv_running = True
         try:
             if self.adv_btn_start:
-                self.adv_btn_start.configure(text="DETENER")
-        except:
+                self.adv_btn_start.configure(text="RECALCULAR")
+        except Exception:
             pass
-
-        # tick loop
-        self._adv_tick()
 
     def _adv_tick(self):
         if not self.adv_running:
@@ -5496,8 +5512,12 @@ class KClientApp(ctk.CTk):
                         )
 
                 # Repite para cada widget que actualices
+                color = "#2ecc71" if status == "ONLINE" else "#e74c3c"
+                try:
+                    self._cache_set_status(user, status, color=color)
+                except Exception:
+                    pass
                 if hasattr(self, "employees_panel") and self.employees_panel and self.employees_panel.winfo_exists():
-                    color = "#2ecc71" if status == "ONLINE" else "#e74c3c"
                     self.employees_panel.set_user_status(user, status, color=color)
             except Exception as e:
                 print(f"Widget ya no existe, ignorando actualización: {e}")
@@ -7634,7 +7654,7 @@ class KClientApp(ctk.CTk):
 
         # aviso (una sola vez por caída)
         try:
-            if not getattr(self, "_reconnect_in_progress", False):
+            if (not getattr(self, "_closing", False)) and (not getattr(self, "_reconnect_in_progress", False)):
                 self.after(0, lambda: messagebox.showwarning("Desconectado", "Se perdió la conexión con el servidor."))
         except Exception:
             pass
@@ -7743,8 +7763,12 @@ class KClientApp(ctk.CTk):
                 self._stats_block_lines = [history_raw] if history_raw else []
 
                 # UI rápida de estado (card + detalle)
+                color = OK if status == "ONLINE" else DANGER
+                try:
+                    self._cache_set_status(user, status, color=color)
+                except Exception:
+                    pass
                 if hasattr(self, "employees_panel") and self.employees_panel and self.employees_panel.winfo_exists():
-                    color = OK if status == "ONLINE" else DANGER
                     self.employees_panel.set_user_status(user, status, color=color)
 
                 if self.selected_user_var.get() == user:
@@ -7916,6 +7940,26 @@ class KClientApp(ctk.CTk):
             self.connected = False
         except Exception:
             pass
+        try:
+            self._auto_stats_stop.set()
+        except Exception:
+            pass
+        try:
+            self._hourly_shots_stop.set()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_adv_tick_job", None):
+                self.after_cancel(self._adv_tick_job)
+        except Exception:
+            pass
+        self._adv_tick_job = None
+        try:
+            if getattr(self, "_stats_flush_after_id", None):
+                self.after_cancel(self._stats_flush_after_id)
+        except Exception:
+            pass
+        self._stats_flush_after_id = None
 
         # 3) cerrar socket y desbloquear recv()
         try:
