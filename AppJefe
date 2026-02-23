@@ -568,6 +568,18 @@ class ScreenshotGallery(ctk.CTkFrame):
         except tk.TclError:
             return
 
+    def _set_pil_img_safe(self, lbl, pil_img, gen: int):
+        try:
+            if getattr(self, "_gen", None) != gen:
+                return
+            if not lbl or not lbl.winfo_exists():
+                return
+            img_tk = ImageTk.PhotoImage(pil_img)
+            lbl.configure(image=img_tk, text="")
+            lbl.image = img_tk
+        except Exception:
+            return
+
     def _set_text_safe(self, lbl, text: str, gen: int):
         try:
             if getattr(self, "_gen", None) != gen:
@@ -850,8 +862,8 @@ class ScreenshotGallery(ctk.CTkFrame):
                 return
 
             img.thumbnail((820, 420))
-            img_tk = ImageTk.PhotoImage(img)
-            self.after(0, lambda lw=lbl_widget, im=img_tk, g=gen: self._set_img_safe(lw, im, g))
+            img = img.copy()
+            self.after(0, lambda lw=lbl_widget, im=img, g=gen: self._set_pil_img_safe(lw, im, g))
 
         except Exception as e:
             self.after(0, lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, f"Error: {e}", g))
@@ -2626,7 +2638,7 @@ class PerfomanceView(ctk.CTkFrame):
         score = None
         try:
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(timeout=35)
 
             system_prompt = (
                 "Sos un analista de productividad para una agencia de viajes.\n"
@@ -3178,7 +3190,7 @@ class PerfomanceView(ctk.CTkFrame):
         out_text = ""
         try:
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(timeout=35)
 
             system_prompt = (
                 "Sos un asistente para un jefe que monitorea productividad en una agencia de viajes.\n"
@@ -3265,7 +3277,7 @@ class PerfomanceView(ctk.CTkFrame):
         """
         try:
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(timeout=35)
 
             system_prompt  = (
                 "Sos un asistente para un jefe que monitorea actividad/productividad.\n"
@@ -3956,7 +3968,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             widget.destroy()
 
         # figura
-        fig, ax = plt.subplots(figsize=(3, 2), dpi=100)
+        fig, ax = plt.subplots(figsize=(5.0, 3.1), dpi=100)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
 
@@ -4005,7 +4017,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         labels = [a[:32] for a, _ in items]
         hours = [(sec / 3600.0) for _, sec in items]
 
-        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+        fig, ax = plt.subplots(figsize=(5.2, 3.2), dpi=100)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
         ax.bar(labels, hours, color='#3498db')
@@ -4058,7 +4070,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         self.lbl_added = ctk.CTkLabel(tab, text="Factores: Ninguno")
         self.lbl_added.pack(pady=(0, 6))
 
-        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+        fig, ax = plt.subplots(figsize=(5.2, 3.2), dpi=100)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
         ax.text(0.5, 0.5, "Añadí factores arriba", color="white", ha="center", va="center")
@@ -4146,7 +4158,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             text_color="white"
         ).pack(side="left", padx=12)
 
-        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+        fig, ax = plt.subplots(figsize=(5.2, 3.2), dpi=100)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
 
@@ -5198,6 +5210,17 @@ class KClientApp(ctk.CTk):
         # =========================
         self._build_login()
         self.after(350, self._try_autologin)
+
+    def _run_on_ui(self, fn, delay_ms: int = 0) -> bool:
+        try:
+            if getattr(self, "_closing", False):
+                return False
+            if not self.winfo_exists():
+                return False
+            self.after(max(0, int(delay_ms)), fn)
+            return True
+        except Exception:
+            return False
 
     # ----------------------------
     # LOGIN UI
@@ -7642,19 +7665,20 @@ class KClientApp(ctk.CTk):
         except:
             txt = ""
 
-        # actualizar PerformanceView si existe
-        try:
-            if hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists():
-                self.after(0, lambda: self.perf_view.set_ai_log_text(user, day, txt))
-        except Exception as e:
-            print("_handle_ai_log_bytes ui error:", e)
+        def ui():
+            try:
+                if hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists():
+                    self.perf_view.set_ai_log_text(user, day, txt)
+            except Exception as e:
+                print("_handle_ai_log_bytes ui error:", e)
 
-        # opcional: también mandar a consola
-        try:
-            if self.console_win and self.console_win.winfo_exists():
-                self.console_win.add_output(f"\n[AI LOG] {user} {day}\n")
-        except:
-            pass
+            try:
+                if self.console_win and self.console_win.winfo_exists():
+                    self.console_win.add_output(f"\n[AI LOG] {user} {day}\n")
+            except Exception:
+                pass
+
+        self._run_on_ui(ui)
 
     # ----------------------------
     # Listen loop (server -> UI)
@@ -7718,10 +7742,7 @@ class KClientApp(ctk.CTk):
                     print(line_str)
                     # ✅ Respuesta de chat IA (texto)
                     if line_str.startswith("AI_CHAT_RESP|"):
-                        try:
-                            self._handle_ai_chat_resp_line(line_str)
-                        except Exception as e:
-                            print("AI_CHAT_RESP error:", e)
+                        self._run_on_ui(lambda l=line_str: self._handle_ai_chat_resp_line(l))
                         continue
 
                     if line_str.startswith("PHOTO_DATA|"):
@@ -7768,8 +7789,8 @@ class KClientApp(ctk.CTk):
                             print("AI_LOG_DATA header incompleto:", line_str)
                             continue
 
-                    # 4) Línea normal de texto
-                    self.handle_line(line_str)
+                    # 4) Línea normal de texto (siempre en UI thread)
+                    self._run_on_ui(lambda l=line_str: self.handle_line(l))
 
             except Exception as e:
                 print("listen_loop:", e)
@@ -7787,10 +7808,7 @@ class KClientApp(ctk.CTk):
         except Exception:
             pass
         self.sock = None
-        try:
-            self._set_connection_state(False)
-        except Exception:
-            pass
+        self._run_on_ui(lambda: self._set_connection_state(False))
 
         # aviso (una sola vez por caída)
         try:
@@ -7834,16 +7852,20 @@ class KClientApp(ctk.CTk):
                 # fallback
                 shutil.move(tmp_path, out_path)
 
-            # refrescar UI (si la galería está abierta)
-            if self.gallery_win and self.gallery_win.winfo_exists():
-                self.after(0, self.gallery_win.load_local_filenames)
+            # refrescar UI (si la galería / preview están abiertas)
+            def ui_refresh():
+                try:
+                    if self.gallery_win and self.gallery_win.winfo_exists():
+                        self.gallery_win.load_local_filenames()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "preview_editor") and self.preview_editor and self.preview_editor.winfo_exists():
+                        self.preview_editor.load_image_path(out_path)
+                except Exception:
+                    pass
 
-            # ✅ NUEVO: mostrar la última captura en el bloque abajo izquierda
-            try:
-                if hasattr(self, "preview_editor") and self.preview_editor and self.preview_editor.winfo_exists():
-                    self.after(0, lambda p=out_path: self.preview_editor.load_image_path(p))
-            except Exception:
-                pass
+            self._run_on_ui(ui_refresh)
 
         except Exception as e:
             print("_handle_photo_data_bytes:", e)
