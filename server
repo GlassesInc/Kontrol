@@ -2044,7 +2044,7 @@ class TerminalServer:
                                     evt["task_id"] = tid
                                     evt["task"] = task
 
-                                elif action in ("update", "edit"):
+                                elif action in ("update", "edit", "updated"):
                                     task = evt.get("task") if isinstance(evt.get("task"), dict) else {}
                                     tid = task.get("id") or evt.get("task_id")
                                     if not tid:
@@ -2069,7 +2069,7 @@ class TerminalServer:
                                         evt["task"] = task
                                         evt["task_id"] = tid
 
-                                elif action in ("delete", "remove"):
+                                elif action in ("delete", "remove", "deleted"):
                                     tid = evt.get("task_id") or (evt.get("task") or {}).get("id")
                                     if not tid:
                                         continue
@@ -2078,7 +2078,7 @@ class TerminalServer:
                                         tasks_list.pop(idx)
                                     evt["task_id"] = tid
 
-                                elif action in ("finish", "done", "completed"):
+                                elif action in ("finish", "done", "completed", "complete"):
                                     tid = evt.get("task_id") or (evt.get("task") or {}).get("id")
                                     if not tid:
                                         continue
@@ -2091,6 +2091,7 @@ class TerminalServer:
 
                                 # guardar siempre
                                 self._save_user_tasks(assignee, tasks_list)
+                                self._append_task_change_log(assignee, evt)
 
                             # broadcast a todos los jefes + al empleado asignado
                             try:
@@ -2105,11 +2106,11 @@ class TerminalServer:
                                     title = ((evt.get("task") or {}).get("title") or (evt.get("task") or {}).get(
                                         "name") or "tarea")
                                     msg_txt = f"{boss_name} te añadió: {title}"
-                                elif action in ("update", "edit"):
+                                elif action in ("update", "edit", "updated"):
                                     msg_txt = f"{boss_name} editó una tarea tuya."
-                                elif action in ("delete", "remove"):
+                                elif action in ("delete", "remove", "deleted"):
                                     msg_txt = f"{boss_name} eliminó una tarea tuya."
-                                elif action in ("finish", "done", "completed"):
+                                elif action in ("finish", "done", "completed", "complete"):
                                     msg_txt = f"{boss_name} marcó una tarea como finalizada."
                                 if msg_txt:
                                     self._send_to_user_if_online(assignee, f"SHOW_POPUP|Tareas|{msg_txt}")
@@ -2491,6 +2492,26 @@ class TerminalServer:
             with open(fp, "w", encoding="utf-8") as f:
                 json.dump(tasks_list, f, ensure_ascii=False, indent=2)
         except:
+            pass
+
+
+    def _task_changes_fp(self, user: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_\-]", "_", (user or "unknown"))
+        d = os.path.join(self.tasks_dir, "changes")
+        ensure_dir(d)
+        return os.path.join(d, f"{safe}.jsonl")
+
+    def _append_task_change_log(self, user: str, payload: dict):
+        try:
+            fp = self._task_changes_fp(user)
+            rec = {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "user": user,
+                "payload": payload if isinstance(payload, dict) else {"raw": str(payload)},
+            }
+            with open(fp, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
             pass
 
     def _format_activity_day_as_hist(self, day_data: dict, top_n: int = 10) -> str:
