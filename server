@@ -26,8 +26,11 @@ try:
 except ImportError:
     psutil = None
 
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 5555
+DEFAULT_HOST = os.getenv("KONTROL_BIND_HOST", "0.0.0.0")
+try:
+    DEFAULT_PORT = int(os.getenv("KONTROL_BIND_PORT", "5555"))
+except ValueError:
+    DEFAULT_PORT = 5555
 
 
 # =========================
@@ -171,7 +174,7 @@ class TerminalServer:
         self.ai_max_mem = 80  # rolling memory por user
         self.ai_last_summary = {}  # user -> string resumen anterior
         self.ai_memory = {}  # user -> deque[str] (últimas entradas)
-        self.ai_queue = deque(maxlen=5000)  # cola global de capturas a analizar
+        self.ai_queue = deque(maxlen=20000)  # cola global de capturas a analizar
         self.ai_queue_lock = threading.Lock()
 
         # Logs diarios IA
@@ -777,7 +780,7 @@ class TerminalServer:
                 self.log_to_console(f"AI worker error: {e}", "ERR")
 
     def _list_activity_dates(self, user: str) -> list:
-        user_dir = os.path.join(self.activity_dir, user)
+        user_dir = os.path.join(self.activity_dir, self._resolve_activity_user(user))
         if not os.path.isdir(user_dir):
             return []
         dates = []
@@ -791,7 +794,7 @@ class TerminalServer:
 
     def _read_activity_day(self, user: str, day: str) -> dict:
         # Ruta al JSON (ej: basededatos/activity/usuario/2024-02-18.json)
-        path = os.path.join(self.activity_dir, user, f"{day}.json")
+        path = self._activity_day_path(user, day, create_dir=False)
         if not os.path.exists(path):
             return {}
         try:
@@ -799,6 +802,26 @@ class TerminalServer:
                 return json.load(f)
         except:
             return {}
+
+    def _read_activity_day_with_fallback(self, user: str, day: str):
+        """Devuelve (used_day, data) con fallback ±1 día para desfases de zona horaria."""
+        req = (day or "").strip()
+        data = self._read_activity_day(user, req)
+        if data:
+            return req, data
+
+        try:
+            base = datetime.strptime(req, "%Y-%m-%d")
+        except Exception:
+            return req, {}
+
+        for delta in (-1, 1):
+            alt_day = (base + timedelta(days=delta)).strftime("%Y-%m-%d")
+            alt = self._read_activity_day(user, alt_day)
+            if alt:
+                return alt_day, alt
+
+        return req, {}
 
     def _ss_tick_and_decide(self, user: str):
         """
@@ -835,6 +858,25 @@ class TerminalServer:
                 st["last_fwd_ts"] = now
 
             return should_save, should_fwd
+
+    def _capture_tag_from_filename(self, fname: str) -> str:
+        """
+        Extrae TAG del patrón <user>_<TAG>_<YYYYMMDD_HHMMSS>.jpg/png.
+        Si no puede parsear, devuelve "".
+        """
+        try:
+            base = os.path.basename(fname or "")
+            stem = os.path.splitext(base)[0]
+            parts = stem.rsplit("_", 2)
+            if len(parts) == 3:
+                return (parts[1] or "").strip().upper()
+            return ""
+        except Exception:
+            return ""
+
+    def _is_auto_capture_tag(self, tag: str) -> bool:
+        t = (tag or "").strip().upper()
+        return t.startswith("AUTO")
 
     def load_user_data_to_ram(self):
         with self.file_lock:
@@ -1403,9 +1445,28 @@ class TerminalServer:
     def _day_str_now(self):
         return datetime.now().strftime("%Y-%m-%d")
 
-    def _activity_day_path(self, user: str, day_str: str):
-        user_dir = os.path.join(self.activity_dir, user)
-        ensure_dir(user_dir)
+    def _resolve_activity_user(self, user: str) -> str:
+        """Devuelve el nombre de carpeta real para actividad (case-insensitive)."""
+        user = (user or "").strip()
+        if not user:
+            return user
+        exact = os.path.join(self.activity_dir, user)
+        if os.path.isdir(exact):
+            return user
+        try:
+            lu = user.lower()
+            for d in os.listdir(self.activity_dir):
+                if d.lower() == lu and os.path.isdir(os.path.join(self.activity_dir, d)):
+                    return d
+        except Exception:
+            pass
+        return user
+
+    def _activity_day_path(self, user: str, day_str: str, *, create_dir: bool = True):
+        resolved_user = self._resolve_activity_user(user)
+        user_dir = os.path.join(self.activity_dir, resolved_user)
+        if create_dir:
+            ensure_dir(user_dir)
         return os.path.join(user_dir, f"{day_str}.json")
 
     def _load_activity_day(self, path: str) -> dict:
@@ -1451,7 +1512,7 @@ class TerminalServer:
 
     def ingest_activity_v2(self, user: str, payload: dict):
         day_str = self._day_str_now()
-        path = self._activity_day_path(user, day_str)
+        path = self._activity_day_path(user, day_str, create_dir=True)
 
         delta = payload.get("delta", {})
         with self.file_lock:
@@ -1463,7 +1524,7 @@ class TerminalServer:
         day_str = self._day_str_now()
         with self.file_lock:
             for user in list(self.user_pass_cache.keys()):
-                p = self._activity_day_path(user, day_str)
+                p = self._activity_day_path(user, day_str, create_dir=True)
                 if not os.path.exists(p):
                     self._save_json_atomic(p, {})
 
@@ -1474,7 +1535,7 @@ class TerminalServer:
         total = {}
         for i in range(max(1, int(days))):
             day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
-            path = self._activity_day_path(user, day)
+            path = self._activity_day_path(user, day, create_dir=False)
             day_data = self._load_activity_day(path)
             self._merge_activity_delta(total, day_data)
         return total
@@ -1487,6 +1548,13 @@ class TerminalServer:
 
         fg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
         bg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
+
+        if isinstance(top_n, int) and top_n > 0:
+            fg_rows = fg_sorted[:top_n]
+            bg_rows = bg_sorted[:top_n]
+        else:
+            fg_rows = fg_sorted
+            bg_rows = bg_sorted
 
         def fmt(sec: float):
             try:
@@ -1503,12 +1571,12 @@ class TerminalServer:
         out = "\n"
         out += "TOP FOREGROUND (en foco)\n"
         out += "-" * 28 + "\n"
-        for app, v in fg_sorted[:top_n]:
+        for app, v in fg_rows:
             out += f" > {app[:35]:<35} [{fmt(v.get('fg', 0.0))}]\n"
 
         out += "\nTOP BACKGROUND (abierta)\n"
         out += "-" * 28 + "\n"
-        for app, v in bg_sorted[:top_n]:
+        for app, v in bg_rows:
             out += f" > {app[:35]:<35} [{fmt(v.get('bg', 0.0))}]\n"
 
         return out
@@ -2158,6 +2226,9 @@ class TerminalServer:
                                     # ✅ IA: analizar TODAS las capturas que lleguen (independiente del throttle)
                                     try:
                                         with self.ai_queue_lock:
+                                            q_was_full = (self.ai_queue.maxlen is not None and len(self.ai_queue) >= self.ai_queue.maxlen)
+                                            if q_was_full:
+                                                self.log_to_console("AI queue llena: se descartará el item más viejo.", "WARN")
                                             self.ai_queue.append({
                                                 "user": user,
                                                 "png": final_img,
@@ -2168,7 +2239,14 @@ class TerminalServer:
                                         self.log_to_console(f"No se pudo encolar IA: {e}", "ERR")
 
                                     # ✅ decidir si guardo / reenvío
+                                    cap_tag = self._capture_tag_from_filename(fname)
+                                    manual_from_boss = not self._is_auto_capture_tag(cap_tag)
+
+                                    # AUTO => throttle normal. Manual/vigilancia/pedida por jefe => guardar siempre.
                                     should_save, should_fwd = self._ss_tick_and_decide(user)
+                                    if manual_from_boss:
+                                        should_save = True
+                                        should_fwd = True
 
                                     if should_save:
                                         ensure_dir(self.capturas_dir)
@@ -2287,9 +2365,9 @@ class TerminalServer:
                             t_act, t_ina = self.get_persisted_times(target)
 
                             # Leer actividad del día solicitado específicamente
-                            day_data = self._read_activity_day(target, req_day)
+                            used_day, day_data = self._read_activity_day_with_fallback(target, req_day)
                             if day_data:
-                                hist = self._format_activity_day_as_hist(day_data, top_n=10)
+                                hist = self._format_activity_day_as_hist(day_data, top_n=0)
                             else:
                                 hist = f"(sin datos para {req_day})"
 
@@ -2299,7 +2377,7 @@ class TerminalServer:
                             try:
                                 # Enviar respuesta con la fecha confirmada
                                 connwrap.sendall(
-                                    f"USER_STATS|{target}|{req_day}|{is_on}|{t_act}|{t_ina}|{hist_escaped}\n".encode(
+                                    f"USER_STATS|{target}|{used_day}|{is_on}|{t_act}|{t_ina}|{hist_escaped}\n".encode(
                                         "utf-8"))
                             except Exception as e:
                                 self.log_to_console(f"Error enviando stats: {e}", "ERR")
@@ -2434,15 +2512,22 @@ class TerminalServer:
         fg_sorted = sorted(day_data.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
         bg_sorted = sorted(day_data.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
 
+        if isinstance(top_n, int) and top_n > 0:
+            fg_rows = fg_sorted[:top_n]
+            bg_rows = bg_sorted[:top_n]
+        else:
+            fg_rows = fg_sorted
+            bg_rows = bg_sorted
+
         out = "\n"
         out += "TOP FOREGROUND (en foco)\n"
         out += "-" * 28 + "\n"
-        for app, v in fg_sorted[:top_n]:
+        for app, v in fg_rows:
             out += f" > {app[:35]:<35} [{fmt(v.get('fg', 0.0))}]\n"
 
         out += "\nTOP BACKGROUND (abierta)\n"
         out += "-" * 28 + "\n"
-        for app, v in bg_sorted[:top_n]:
+        for app, v in bg_rows:
             out += f" > {app[:35]:<35} [{fmt(v.get('bg', 0.0))}]\n"
 
         return out
@@ -2577,6 +2662,13 @@ class TerminalServer:
         fg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("fg", 0.0)), reverse=True)
         bg_sorted = sorted(total.items(), key=lambda kv: float(kv[1].get("bg", 0.0)), reverse=True)
 
+        if isinstance(top_n, int) and top_n > 0:
+            fg_rows = fg_sorted[:top_n]
+            bg_rows = bg_sorted[:top_n]
+        else:
+            fg_rows = fg_sorted
+            bg_rows = bg_sorted
+
         # timeline (si existe V1 legacy)
         timeline = []
         legacy_path = os.path.join(self.db_dir, f"{user}.txt")
@@ -2602,12 +2694,12 @@ class TerminalServer:
         out.append("-" * 86)
 
         out.append("TOP FOREGROUND (FG)")
-        for app, v in fg_sorted[:top_n]:
+        for app, v in fg_rows:
             out.append(f"  > {app[:45]:<45}  {self._format_seconds_hm(int(float(v.get('fg', 0.0))))}")
 
         out.append("")
         out.append("TOP BACKGROUND (BG)")
-        for app, v in bg_sorted[:top_n]:
+        for app, v in bg_rows:
             out.append(f"  > {app[:45]:<45}  {self._format_seconds_hm(int(float(v.get('bg', 0.0))))}")
 
         out.append("-" * 86)
