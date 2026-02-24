@@ -32,8 +32,11 @@ from googleapiclient.discovery import build
 # =========================
 # CONFIG
 # =========================
-DEFAULT_HOST = "185.254.207.202"
-DEFAULT_PORT = 5555
+DEFAULT_HOST = os.getenv("KONTROL_SERVER_HOST", "185.254.207.202")
+try:
+    DEFAULT_PORT = int(os.getenv("KONTROL_SERVER_PORT", "5555"))
+except ValueError:
+    DEFAULT_PORT = 5555
 
 ctk.set_appearance_mode("Dark")
 
@@ -154,6 +157,12 @@ def log_gcal_print_line(print_text: str, user_id: str, base_dir: str = None):
 def get_appdata_base_dir() -> str:
     base = os.getenv("APPDATA") or os.path.expanduser("~")
     folder = os.path.join(base, "CSDViajes", "KClient")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def get_prodmanager_base_dir() -> str:
+    base = os.getenv("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(base, "CSDViajes", "ProdManager")
     os.makedirs(folder, exist_ok=True)
     return folder
 import os
@@ -325,6 +334,14 @@ class AppEmpleado(ctk.CTk):
 
         self._cfg_version = 0
         self._cfg_keywords = []
+
+        # tasks sync -> server
+        self._tasks_sync_after_id = None
+        self._tasks_sync_interval_ms = 15 * 60 * 1000
+        self._tasks_events_after_id = None
+        self._tasks_events_poll_ms = 45 * 1000
+        self._tasks_last_sent_fp = {}
+        self._tasks_events_cursor = 0
 
         # arrancar
         self._build_login_ui()
@@ -1357,6 +1374,196 @@ class AppEmpleado(ctk.CTk):
                 self.sock = None
                 break
 
+    def _prod_tasks_file(self) -> str:
+        return os.path.join(get_prodmanager_base_dir(), "tasks.json")
+
+    def _prod_events_file(self) -> str:
+        return os.path.join(get_prodmanager_base_dir(), "events.jsonl")
+
+    def _prod_events_cursor_file(self) -> str:
+        return os.path.join(get_appdata_base_dir(), "tasks_events_cursor.json")
+
+    def _load_tasks_events_cursor(self) -> int:
+        try:
+            p = self._prod_events_cursor_file()
+            if not os.path.exists(p):
+                return 0
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f) or {}
+            return int(d.get("pos", 0) or 0)
+        except Exception:
+            return 0
+
+    def _save_tasks_events_cursor(self, pos: int):
+        try:
+            with open(self._prod_events_cursor_file(), "w", encoding="utf-8") as f:
+                json.dump({"pos": int(pos)}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _load_local_tasks(self) -> list:
+        fp = self._prod_tasks_file()
+        if not os.path.exists(fp):
+            return []
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            arr = data.get("tasks", []) if isinstance(data, dict) else []
+            return arr if isinstance(arr, list) else []
+        except Exception:
+            return []
+
+    def _send_task_evt(self, evt: dict):
+        try:
+            if not self.connected or not self.sock:
+                return
+            self._send_line("TASK_EVT|" + json.dumps(evt, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _tasks_sync_snapshot_to_server(self, force: bool = False):
+        tasks = self._load_local_tasks()
+        assignee = (self.current_user or "").strip()
+        if not assignee:
+            return
+
+        current_ids = set()
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            tid = (t.get("id") or t.get("task_id") or "").strip()
+            if not tid:
+                continue
+            current_ids.add(tid)
+            t_norm = dict(t)
+            t_norm["id"] = tid
+            t_norm["assignee"] = assignee
+            fp = hashlib.sha1(json.dumps(t_norm, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+            if force or self._tasks_last_sent_fp.get(tid) != fp:
+                self._send_task_evt({
+                    "action": "update",
+                    "actor": assignee,
+                    "assignee": assignee,
+                    "task_id": tid,
+                    "task": t_norm,
+                })
+                self._tasks_last_sent_fp[tid] = fp
+
+        # deletions
+        prev_ids = set(self._tasks_last_sent_fp.keys())
+        for tid in sorted(prev_ids - current_ids):
+            self._send_task_evt({
+                "action": "delete",
+                "actor": assignee,
+                "assignee": assignee,
+                "task_id": tid,
+            })
+            self._tasks_last_sent_fp.pop(tid, None)
+
+    def _tasks_sync_events_to_server(self):
+        fp = self._prod_events_file()
+        if not os.path.exists(fp):
+            return
+
+        try:
+            pos = self._tasks_events_cursor
+            size = os.path.getsize(fp)
+            if pos > size:
+                pos = 0
+
+            with open(fp, "r", encoding="utf-8") as f:
+                f.seek(pos)
+                for line in f:
+                    pos = f.tell()
+                    line = (line or "").strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+
+                    ev_type = (ev.get("event_type") or "").upper()
+                    tid = (ev.get("task_id") or "").strip()
+                    assignee = (self.current_user or "").strip()
+                    if not assignee or not tid:
+                        continue
+
+                    if ev_type in ("TASK_COMPLETED",):
+                        self._send_task_evt({
+                            "action": "completed",
+                            "actor": assignee,
+                            "assignee": assignee,
+                            "task_id": tid,
+                        })
+                    elif ev_type in ("TIMER_STOPPED", "TIME_ADDED_MANUAL"):
+                        # upsert del task actualizado (tiempo)
+                        all_tasks = self._load_local_tasks()
+                        for t in all_tasks:
+                            if not isinstance(t, dict):
+                                continue
+                            ttid = (t.get("id") or t.get("task_id") or "").strip()
+                            if ttid != tid:
+                                continue
+                            t_norm = dict(t)
+                            t_norm["id"] = tid
+                            t_norm["assignee"] = assignee
+                            self._send_task_evt({
+                                "action": "update",
+                                "actor": assignee,
+                                "assignee": assignee,
+                                "task_id": tid,
+                                "task": t_norm,
+                            })
+                            break
+
+            self._tasks_events_cursor = pos
+            self._save_tasks_events_cursor(pos)
+        except Exception:
+            pass
+
+    def _start_tasks_sync_loops(self):
+        self._stop_tasks_sync_loops()
+        self._tasks_events_cursor = self._load_tasks_events_cursor()
+
+        def tick_snapshot():
+            try:
+                self._tasks_sync_after_id = self.after(self._tasks_sync_interval_ms, tick_snapshot)
+            except Exception:
+                self._tasks_sync_after_id = None
+                return
+            if self.connected and self.sock:
+                self._tasks_sync_snapshot_to_server(force=False)
+
+        def tick_events():
+            try:
+                self._tasks_events_after_id = self.after(self._tasks_events_poll_ms, tick_events)
+            except Exception:
+                self._tasks_events_after_id = None
+                return
+            if self.connected and self.sock:
+                self._tasks_sync_events_to_server()
+
+        # first immediate
+        if self.connected and self.sock:
+            self._tasks_sync_snapshot_to_server(force=True)
+            self._tasks_sync_events_to_server()
+
+        self._tasks_sync_after_id = self.after(self._tasks_sync_interval_ms, tick_snapshot)
+        self._tasks_events_after_id = self.after(self._tasks_events_poll_ms, tick_events)
+
+    def _stop_tasks_sync_loops(self):
+        for a in ("_tasks_sync_after_id", "_tasks_events_after_id"):
+            try:
+                aid = getattr(self, a, None)
+                if aid:
+                    self.after_cancel(aid)
+            except Exception:
+                pass
+            setattr(self, a, None)
+
+
     # =========================
     # UI principal (Tareas como pantalla única)
     # =========================
@@ -1547,6 +1754,7 @@ class AppEmpleado(ctk.CTk):
         self._start_keepalive()
         self._start_activity_loop()
         self._start_screenshot_scheduler()
+        self._start_tasks_sync_loops()
 
     def _on_close(self):
         try:
@@ -1569,6 +1777,10 @@ class AppEmpleado(ctk.CTk):
             pass
         try:
             self._stop_screenshot_scheduler()
+        except Exception:
+            pass
+        try:
+            self._stop_tasks_sync_loops()
         except Exception:
             pass
 
