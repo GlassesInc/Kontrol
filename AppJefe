@@ -1,104 +1,4 @@
 
-"""
-FIX DEFINITIVO: RuntimeError: main thread is not in main loop en __del__
-=========================================================================
-
-CAUSA REAL (después de leer todo el código):
-- ScreenshotEditor._render() crea ImageTk.PhotoImage y lo guarda en self._img_tk
-- Cuando _render_all_tabs() destruye/recrea tabs, el viejo ImageTk queda sin
-  referencia fuerte → el GC lo destruye
-- ctk.StringVar (user_var, day_var, etc.) también se crean en PerfomanceView.__init__
-- El GC de CPython puede correr en CUALQUIER thread (incluyendo el de OpenAI)
-- Image.__del__ y Variable.__del__ intentan llamar a Tk desde ese thread → RuntimeError
-
-SOLUCIÓN REAL:
-1. Parchear __del__ de tkinter.Image y tkinter.Variable para que si falla
-   con RuntimeError, lo ignore silenciosamente (ya lo hace Python con
-   "Exception ignored in", pero igual imprime en stderr)
-2. Más importante: parchear para que NO llame a tk.call si no estamos en
-   el hilo principal
-
-APLICAR: Agregar estas líneas MUY al inicio de appJefe.py,
-ANTES de cualquier import de tkinter o customtkinter:
-
-    import fix_tkinter_del  # <-- agregar esta línea al inicio
-
-O copiar el contenido directamente al inicio de appJefe.py después de los imports
-de sys/threading pero ANTES de los imports de tkinter/customtkinter.
-"""
-
-import threading
-import tkinter
-
-
-# ============================================================
-# PATCH 1: tkinter.Image.__del__
-# Evita RuntimeError cuando el GC destruye ImageTk desde un thread secundario
-# ============================================================
-_original_image_del = tkinter.Image.__del__
-
-
-def _safe_image_del(self):
-    # Solo ejecutar si estamos en el hilo principal de Tk
-    # Si no, simplemente no llamar a tk.call (la imagen quedará "huérfana"
-    # pero no crasheará ni imprimirá errores)
-    if threading.current_thread() is threading.main_thread():
-        try:
-            _original_image_del(self)
-        except Exception:
-            pass
-    else:
-        # Estamos en un thread secundario: no podemos llamar a Tk.
-        # Encolamos la destrucción en el hilo principal si hay una app Tk activa.
-        try:
-            # Intentar obtener la instancia Tk para usar after()
-            # Si no existe o ya fue destruida, simplemente ignoramos.
-            name = getattr(self, "name", None)
-            tk_inst = getattr(self, "tk", None)
-            if name and tk_inst:
-                # Usar after_idle es thread-safe para encolar
-                # Pero after_idle tampoco se puede llamar desde threads...
-                # La única opción segura es simplemente no hacer nada.
-                # La imagen Tk quedará en memoria del intérprete Tk hasta que
-                # el intérprete Tk se destruya (lo cual es aceptable).
-                pass
-        except Exception:
-            pass
-
-
-tkinter.Image.__del__ = _safe_image_del
-
-
-# ============================================================
-# PATCH 2: tkinter.Variable.__del__
-# Mismo problema: StringVar, IntVar, etc. se destruyen desde threads
-# ============================================================
-_original_variable_del = tkinter.Variable.__del__
-
-
-def _safe_variable_del(self):
-    if threading.current_thread() is threading.main_thread():
-        try:
-            _original_variable_del(self)
-        except Exception:
-            pass
-    else:
-        # No podemos limpiar desde un thread secundario.
-        # Dejar que el intérprete Tk limpie cuando se destruya.
-        pass
-
-
-tkinter.Variable.__del__ = _safe_variable_del
-
-
-# ============================================================
-# VERIFICACIÓN
-# ============================================================
-if __name__ == "__main__":
-    print("Patches aplicados:")
-    print(f"  tkinter.Image.__del__ = {tkinter.Image.__del__}")
-    print(f"  tkinter.Variable.__del__ = {tkinter.Variable.__del__}")
-    print("OK - Los errores RuntimeError en __del__ ya no aparecerán.")
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox
@@ -1413,7 +1313,7 @@ class PerfomanceView(ctk.CTkFrame):
         self.pie_canvas = None
         self.on_pick_user = on_pick_user
         self.on_load_all = on_load_all
-        self.all_users_stats = all_users_stats or []
+
         self._score_sort = "active"
         self.bar_fig = None
         self.bar_canvas = None
@@ -1421,7 +1321,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         self.kpi_fig = None
         self.kpi_canvas = None
-        self.all_users_stats = all_users_stats or []
+
 
         self.custom_fig = None
         self.custom_ax = None
@@ -1430,7 +1330,7 @@ class PerfomanceView(ctk.CTkFrame):
         self.on_request_ai_summary = on_request_ai_summary
         self._ai_log_text = ""  # cache del último log recibido
         self._ai_log_meta = ""  # “user/date”
-        self.on_ai_chat = None  # callback opcional si lo querés desde master
+
         self._ai_chat_history = []  # lista de (role, text)
         self._ai_threads = []
         self._pv_closing = False
@@ -1475,9 +1375,16 @@ class PerfomanceView(ctk.CTkFrame):
         # para evitar el doble disparo que causaba "queda cargando".
         if not (self.history_raw or "").strip():
             self.set_loading("Cargando datos del usuario...")
+
     def set_users(self, users):
         users = [u for u in (users or []) if u.strip()]
+
+        if not hasattr(self, "user_menu") or self.user_menu is None:
+            self.user_list = users
+            return
+
         self.user_menu.configure(values=users)
+
 
         cur = (self.user_var.get() or "").strip()
 
@@ -1527,11 +1434,7 @@ class PerfomanceView(ctk.CTkFrame):
             except TypeError:
                 self.on_change_user(user)
 
-        # render "vacío" + loading mientras llegan stats
-        try:
-            self._render_all_tabs()
-        except:
-            pass
+
 
     # =========================
     # Helpers tiempo
@@ -1605,25 +1508,26 @@ class PerfomanceView(ctk.CTkFrame):
         except Exception:
             _run()
 
-    def update_data(self, active_time_str=None, inactive_time_str=None, history_raw=None, all_users_stats=None,
-                    user_list=None):
-        # actualiza estado
-        if active_time_str is not None:
-            self.active_sec = self.parse_time_to_seconds(active_time_str)
-        if inactive_time_str is not None:
-            self.inactive_sec = self.parse_time_to_seconds(inactive_time_str)
-        if history_raw is not None:
-            self.history_raw = history_raw or ""
-        if all_users_stats is not None:
-            self.all_users_stats = all_users_stats or []
-        if user_list is not None:
-            self.user_list = user_list or []
-            self._refresh_user_menu_values()
-        if all_users_stats is not None:
-            self.all_users_stats = all_users_stats
+    def update_data(self, active_time_str=None, inactive_time_str=None, history_raw=None,
+                    all_users_stats=None, user_list=None):
+        def _do():
+            # actualiza estado (UI-safe)
+            if active_time_str is not None:
+                self.active_sec = self.parse_time_to_seconds(active_time_str)
+            if inactive_time_str is not None:
+                self.inactive_sec = self.parse_time_to_seconds(inactive_time_str)
+            if history_raw is not None:
+                self.history_raw = history_raw or ""
+            if all_users_stats is not None:
+                self.all_users_stats = all_users_stats or []
+            if user_list is not None:
+                self.user_list = user_list or []
+                self._refresh_user_menu_values()
 
-        # quita loading y re-renderiza (debounced para evitar picos)
-        self._schedule_render_tabs(80)
+            # quita loading y re-renderiza (debounced)
+            self._schedule_render_tabs(80)
+
+        return self._ui(_do)
 
     def _parse_duration_to_seconds(self, s: str) -> int:
         import re
@@ -1694,7 +1598,7 @@ class PerfomanceView(ctk.CTkFrame):
         self.user_menu.pack(side="left")
 
         # --- Día (YYYY-MM-DD) ---
-        self.day_var = tk.StringVar(value=self.selected_day)
+        self.day_var = tk.StringVar(value=self.selected_day.isoformat())
         day_box = ctk.CTkFrame(header, fg_color="transparent")
         day_box.pack(side="left", padx=(12, 0))
 
@@ -1861,7 +1765,7 @@ class PerfomanceView(ctk.CTkFrame):
                     pass
                 try:
                     # Desvincular internamente matplotlib del Tk loop
-                    canvas.mpl_disconnect(canvas.mpl_connect("draw_event", lambda e: None))
+                    pass
                 except Exception:
                     pass
                 setattr(self, canvas_attr, None)
@@ -1884,6 +1788,8 @@ class PerfomanceView(ctk.CTkFrame):
         """
         # 1) Cerrar figuras viejas PRIMERO (síncrono, en hilo UI)
         self._dispose_figures()
+        if getattr(self, "_pv_closing", False):
+            return
 
         # 2) Render síncrono de cada tab
         self._safe_setup("Actividad vs Inactividad", self.setup_pie_chart)
@@ -1909,12 +1815,36 @@ class PerfomanceView(ctk.CTkFrame):
         except Exception:
             return ""
 
-    def _safe_after_ui(self, fn):
+    import threading
+
+    def _ui(self, fn, *args, **kwargs):
         """
-        Encola fn en el hilo UI principal.
-        NUNCA ejecuta fn directamente (eso causaría que corra en el thread actual).
+        Ejecuta fn SIEMPRE en el hilo UI (main thread).
+        Si ya estamos en main, ejecuta directo.
+        Si estamos en otro thread (socket/OpenAI), lo encola con after.
         """
         try:
+            if getattr(self, "_pv_closing", False):
+                return None
+            if not self.winfo_exists():
+                return None
+        except Exception:
+            return None
+
+        if threading.current_thread() is threading.main_thread():
+            return fn(*args, **kwargs)
+
+        self._safe_after_ui(lambda: fn(*args, **kwargs))
+        return None
+
+    def _safe_after_ui(self, fn):
+        """
+        Encola fn para que corra en el hilo UI.
+        No ejecuta nunca fn en el thread actual.
+        """
+        try:
+            if getattr(self, "_pv_closing", False):
+                return False
             if not self.winfo_exists():
                 return False
         except Exception:
@@ -1922,11 +1852,15 @@ class PerfomanceView(ctk.CTkFrame):
 
         try:
             top = self.winfo_toplevel()
-            # ✅ Opción 1: usar la cola del KClientApp (lo más seguro)
             if hasattr(top, "_enqueue_ui"):
                 top._enqueue_ui(fn)
                 return True
-            # ✅ Opción 2: usar after(0) — siempre corre en hilo principal
+        except Exception:
+            pass
+
+        try:
+            # after(0) debe ser desde el mismo intérprete Tk; en práctica funciona
+            # si el widget sigue vivo, pero igual lo envolvemos.
             self.after(0, fn)
             return True
         except Exception:
@@ -2676,99 +2610,107 @@ class PerfomanceView(ctk.CTkFrame):
         img_path = base + ".png"
 
         def _worker():
-            """Corre en thread: solo OpenAI y escritura de archivos. SIN tocar widgets."""
-
-            def clean(x):
-                t = str(x or "").replace("€", "EUR").replace("•", "-").replace("→", "->")
-                return t.encode("latin-1", "ignore").decode("latin-1")
-
-            def low_perf(raw, top_n=5):
-                out = []
-                for ln in (raw or "").splitlines():
-                    ln = ln.strip()
-                    if not ln.startswith(">"):
-                        continue
-                    m = re.search(r"\[([^\]]+)\]", ln)
-                    if not m:
-                        continue
-                    try:
-                        sec = int(self.parse_time_to_seconds(m.group(1).strip()) or 0)
-                    except Exception:
-                        sec = 0
-                    if sec <= 0:
-                        continue
-                    name = ln.split("[", 1)[0].replace(">", "").strip()
-                    if any(k in name.lower() for k in DISTRACTION_KEYWORDS):
-                        out.append((name, sec))
-                out.sort(key=lambda x: x[1], reverse=True)
-                return out[:top_n]
-
-            # Construir contexto
-            lines = [
-                f"Fecha: {day}",
-                f"Modo KPI IA: {kpi_mode_snap}",
-                "",
-                "Usuarios:"
-            ]
-            low_perf_global = []
-
-            for ud in users_data:
-                lines.append(
-                    f"- {ud['name']} | rol={ud['role']} | EUR/h={ud['eur_per_hour']} "
-                    f"| KPI={ud['kpi_pct']}% | real={ud['real_s']:.4f} | eff={ud['eff_s']:.4f}"
-                )
-                lines.append(f"  Tareas ({ud['name']}):")
-                for tl in (ud["tasks_txt"] or "Sin tareas.").splitlines()[:15]:
-                    lines.append(f"    {tl}")
-                lp = low_perf(ud["raw"])
-                if lp:
-                    lines.append(f"  Distracciones ({ud['name']}):")
-                    for app, sec in lp:
-                        low_perf_global.append((ud["name"], app, sec))
-                        lines.append(f"    - {app} [{self.format_seconds(sec)}]")
-
-            if ai_log_snap:
-                lines += ["", "Extracto log IA:"] + ai_log_snap[:5000].splitlines()[:30]
-
-            if shots:
-                lines += ["", f"Capturas del día ({len(shots)}):"] + [f"- {f}" for f in shots[:15]]
-
-            # OpenAI (en este thread, seguro)
-            summary = "Resumen: revisar actividades de distracción detectadas."
-            client = None
-            resp = None
             try:
-                import os as _os
-                if _os.getenv("OPENAI_API_KEY"):
-                    from openai import OpenAI
-                    client = OpenAI(timeout=30)
-                    resp = client.responses.create(
-                        model="gpt-4o-mini",
-                        input=[{"role": "user", "content": (
-                                "Genera un resumen ejecutivo del rendimiento diario. "
-                                "Incluye: desvio por rol, apps que bajan rendimiento, recomendaciones.\n\n"
-                                + "\n".join(lines)
-                        )}]
+                """Corre en thread: solo OpenAI y escritura de archivos. SIN tocar widgets."""
+
+                def clean(x):
+                    t = str(x or "").replace("€", "EUR").replace("•", "-").replace("→", "->")
+                    return t.encode("latin-1", "ignore").decode("latin-1")
+
+                def low_perf(raw, top_n=5):
+                    out = []
+                    for ln in (raw or "").splitlines():
+                        ln = ln.strip()
+                        if not ln.startswith(">"):
+                            continue
+                        m = re.search(r"\[([^\]]+)\]", ln)
+                        if not m:
+                            continue
+                        try:
+                            sec = int(self.parse_time_to_seconds(m.group(1).strip()) or 0)
+                        except Exception:
+                            sec = 0
+                        if sec <= 0:
+                            continue
+                        name = ln.split("[", 1)[0].replace(">", "").strip()
+                        if any(k in name.lower() for k in DISTRACTION_KEYWORDS):
+                            out.append((name, sec))
+                    out.sort(key=lambda x: x[1], reverse=True)
+                    return out[:top_n]
+
+                # Construir contexto
+                lines = [
+                    f"Fecha: {day}",
+                    f"Modo KPI IA: {kpi_mode_snap}",
+                    "",
+                    "Usuarios:"
+                ]
+                low_perf_global = []
+
+                for ud in users_data:
+                    lines.append(
+                        f"- {ud['name']} | rol={ud['role']} | EUR/h={ud['eur_per_hour']} "
+                        f"| KPI={ud['kpi_pct']}% | real={ud['real_s']:.4f} | eff={ud['eff_s']:.4f}"
                     )
-                    out = ""
-                    for item in getattr(resp, "output", []) or []:
-                        if getattr(item, "type", None) == "message":
-                            for c in getattr(item, "content", []) or []:
-                                if getattr(c, "type", None) in ("output_text", "text"):
-                                    out += getattr(c, "text", "")
-                    if out.strip():
-                        summary = out.strip()
-            except Exception as e:
-                summary = f"Sin resumen IA: {e}"
-            finally:
+                    lines.append(f"  Tareas ({ud['name']}):")
+                    for tl in (ud["tasks_txt"] or "Sin tareas.").splitlines()[:15]:
+                        lines.append(f"    {tl}")
+                    lp = low_perf(ud["raw"])
+                    if lp:
+                        lines.append(f"  Distracciones ({ud['name']}):")
+                        for app, sec in lp:
+                            low_perf_global.append((ud["name"], app, sec))
+                            lines.append(f"    - {app} [{self.format_seconds(sec)}]")
+
+                if ai_log_snap:
+                    lines += ["", "Extracto log IA:"] + ai_log_snap[:5000].splitlines()[:30]
+
+                if shots:
+                    lines += ["", f"Capturas del día ({len(shots)}):"] + [f"- {f}" for f in shots[:15]]
+
+                # OpenAI (en este thread, seguro)
+                summary = "Resumen: revisar actividades de distracción detectadas."
+                client = None
+                resp = None
                 try:
-                    del resp
-                except Exception:
-                    pass
-                try:
-                    del client
-                except Exception:
-                    pass
+                    import os as _os
+                    if _os.getenv("OPENAI_API_KEY"):
+                        from openai import OpenAI
+                        client = OpenAI(timeout=240)
+                        resp = client.responses.create(
+                            model="gpt-4o-mini",
+                            input=[{"role": "user", "content": (
+                                    "Genera un resumen ejecutivo del rendimiento diario. "
+                                    "Incluye: desvio por rol, apps que bajan rendimiento, recomendaciones.\n\n"
+                                    + "\n".join(lines)
+                            )}]
+                        )
+                        out = ""
+                        for item in getattr(resp, "output", []) or []:
+                            if getattr(item, "type", None) == "message":
+                                for c in getattr(item, "content", []) or []:
+                                    if getattr(c, "type", None) in ("output_text", "text"):
+                                        out += getattr(c, "text", "")
+                        if out.strip():
+                            summary = out.strip()
+                except Exception as e:
+                    summary = f"Sin resumen IA: {e}"
+                finally:
+                    try:
+                        del resp
+                    except Exception:
+                        pass
+                    try:
+                        del client
+                    except Exception:
+                        pass
+                self._safe_after_ui(lambda: _finish_ui(lines, summary, low_perf_global, clean))
+            except:
+                import traceback
+                tb = traceback.format_exc()
+
+                # IMPORTANTÍSIMO: siempre volver a UI y limpiar "Generando..."
+                self._safe_after_ui(lambda: _finish_ui_error(str(e), tb))
 
             # TXT
             try:
@@ -2777,9 +2719,34 @@ class PerfomanceView(ctk.CTkFrame):
             except Exception:
                 pass
 
-            # Pasar al hilo UI para: guardar fig + generar PDF + messagebox
-            self._safe_after_ui(lambda: _finish_ui(lines, summary, low_perf_global, clean))
+            ok = self._safe_after_ui(lambda: _finish_ui(lines, summary, low_perf_global, clean))
+            if not ok:
+                # fallback: al menos escribir TXT y marcar fin sin UI
+                try:
+                    with open(txt_path, "a", encoding="utf-8") as f:
+                        f.write("\n\n[WARN] No se pudo volver al hilo UI para generar PDF.\n")
+                        f.write(f"TXT listo: {txt_path}\nPDF esperado: {pdf_path}\n")
+                except Exception:
+                    pass
 
+            def _finish_ui_error(err_msg, tb):
+                try:
+                    self.clear_loading()
+                except Exception:
+                    pass
+
+                try:
+                    self._adv_totals_lbl.configure(text=f"Error OpenAI: {err_msg}")
+                except Exception:
+                    pass
+
+                # Si tenés un textbox/log UI, acá volcá el traceback
+                try:
+                    if hasattr(self, "adv_text") and self.adv_text:
+                        self.adv_text.delete("1.0", "end")
+                        self.adv_text.insert("1.0", tb)
+                except Exception:
+                    pass
         def _finish_ui(lines, summary, low_perf_global, clean):
             """Corre en hilo UI: guarda figura y genera PDF."""
             # Guardar figura matplotlib (DEBE ser en hilo UI)
@@ -3032,7 +2999,7 @@ class PerfomanceView(ctk.CTkFrame):
         resp = None
         try:
             from openai import OpenAI
-            client = OpenAI(timeout=35)
+            client = OpenAI(timeout=240)
 
             system_prompt = (
                 "Sos un analista de productividad para una agencia de viajes.\n"
@@ -3593,7 +3560,7 @@ class PerfomanceView(ctk.CTkFrame):
             except Exception:
                 pass
 
-        self._safe_after_ui(lambda rid=req_id: self.after(45000, lambda: _watchdog(rid)))
+        self._safe_after_ui(lambda rid=req_id: self.after(4500000, lambda: _watchdog(rid)))
 
         self._start_ai_thread(self._ai_chat_worker_pro, (q, context, req_id))
 
@@ -3603,7 +3570,7 @@ class PerfomanceView(ctk.CTkFrame):
         resp = None
         try:
             from openai import OpenAI
-            client = OpenAI(timeout=35)
+            client = OpenAI(timeout=240)
 
             system_prompt = (
                 "Sos un asistente para un jefe que monitorea productividad en una agencia de viajes.\n"
@@ -3699,7 +3666,7 @@ class PerfomanceView(ctk.CTkFrame):
         """
         try:
             from openai import OpenAI
-            client = OpenAI(timeout=35)
+            client = OpenAI(timeout=240)
 
             system_prompt  = (
                 "Sos un asistente para un jefe que monitorea actividad/productividad.\n"
@@ -3831,20 +3798,30 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         self._safe_after_ui(ui)
 
     def _on_pick_user(self, user):
-        if not user or user == self.target_user:
-            return
-        self.target_user = user
-        try:
-            self.title_lbl.configure(text=f"RENDIMIENTO: {self.target_user}")
-        except:
-            pass
-        if callable(self.on_change_user):
+        def _do():
+            if not user or user == self.target_user:
+                return
+            self.target_user = user
             try:
-                self.on_change_user(user, self.selected_day)
-            except TypeError:
-                self.on_change_user(user)
-        # re-render (por si el caller ya actualizó history_raw/tiempos)
-        self._render_all_tabs()
+                if hasattr(self, "title_lbl") and self.title_lbl:
+                    self.title_lbl.configure(text=f"RENDIMIENTO: {self.target_user}")
+            except Exception:
+                pass
+
+            # pedir datos al server (pero NO renderizar tabs acá con datos viejos)
+            if callable(getattr(self, "on_change_user", None)):
+                try:
+                    self.on_change_user(user, self.selected_day)
+                except TypeError:
+                    self.on_change_user(user)
+
+            # mostrar loading hasta que llegue update_data()
+            try:
+                self.set_loading(f"Cargando datos de {user}…")
+            except Exception:
+                pass
+
+        return self._ui(_do)
 
     def _safe_setup(self, tab_name: str, fn):
         tab = self.tabview.tab(tab_name)
@@ -4153,9 +4130,10 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
                 text="Sin datos todavía. Tocá CARGAR para pedir el ranking.",
                 text_color="gray"
             ).pack(pady=20)
-            return
             if callable(self.on_load_all):
                 self.after(200, self._on_click_load_all)
+            return
+
 
         # ---------------------------------------------------------
         # ✅ Normalización ultra-robusta
