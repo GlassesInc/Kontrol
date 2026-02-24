@@ -2300,6 +2300,108 @@ class PerfomanceView(ctk.CTkFrame):
         ratio = hits / max(1, len(tokens))
         return int(max(50, min(95, 55 + ratio * 40)))
 
+
+    def _adv_expected_rubric_seconds(self) -> dict:
+        # Base de 3 expedientes / día (8h = 28.800s)
+        return {
+            "atencion_cliente": 3600,
+            "presupuesto": 3600,
+            "cobro": 600,
+            "operativa": 12000,
+            "tarjeta_embarque": 1800,
+            "administracion": 7200,
+            "total": 28800,
+            "expedientes_dia": 3,
+        }
+
+    def _adv_role_productive_catalog(self, role_text: str) -> dict:
+        role = (role_text or "").strip().lower()
+
+        base = [
+            "kommo", "csdviajes", "csd viajes", "outlook", "gmail", "google workspace",
+            "drive", "sheets", "excel", "docs", "pdf", "acrobat", "whatsapp business",
+        ]
+        operativa = [
+            "amadeus", "sabre", "travelport", "renfe", "iberia", "ryanair", "vueling",
+            "air europa", "avianca", "latam", "aena", "checkmytrip", "activex", "hotelbeds",
+            "booking", "expedia", "skyscanner", "kayak", "kiwi",
+        ]
+        ventas = [
+            "amadeus", "kommo", "salesforce", "hubspot", "pipedrive", "centralita", "3cx",
+            "asterisk", "aircall", "dialpad", "zoom phone", "meet", "teams", "slack",
+        ]
+        direccion = [
+            "power bi", "tableau", "notion", "trello", "asana", "monday", "analytics",
+            "dashboard", "erp", "crm", "finanzas", "informes", "kpi",
+        ]
+        administracion = [
+            "bank", "banco", "santander", "bbva", "caixabank", "ing", "sabadell", "stripe",
+            "paypal", "factura", "facturacion", "contabilidad", "sage", "holded", "a3", "nomina",
+            "calculadora", "calculator", "hacienda", "aeat", "impuestos",
+        ]
+
+        if "oper" in role:
+            return {"role": "Operativa", "apps": sorted(set(base + operativa))}
+        if "vent" in role:
+            return {"role": "Ventas", "apps": sorted(set(base + ventas))}
+        if "direc" in role:
+            return {"role": "Dirección", "apps": sorted(set(base + direccion + operativa + ventas + administracion))}
+        if "admin" in role:
+            return {"role": "Administración", "apps": sorted(set(base + administracion))}
+        return {"role": role_text or "General", "apps": sorted(set(base))}
+
+    def _adv_extract_app_seconds(self, raw: str) -> dict:
+        out = {}
+        if not isinstance(raw, str) or not raw.strip():
+            return out
+        for ln in raw.splitlines():
+            line = (ln or "").strip()
+            if not line.startswith(">"):
+                continue
+            m = re.search(r"\[([^\]]+)\]", line)
+            if not m:
+                continue
+            try:
+                sec = int(self.parse_time_to_seconds(m.group(1).strip()) or 0)
+            except Exception:
+                sec = 0
+            if sec <= 0:
+                continue
+            app_name = line.split("[", 1)[0].replace(">", "").strip()
+            out[app_name] = out.get(app_name, 0) + sec
+        return out
+
+    def _adv_tasks_mode_ratio(self, role_text: str, raw: str) -> float:
+        app_secs = self._adv_extract_app_seconds(raw)
+        if not app_secs:
+            return 0.55
+
+        catalog = self._adv_role_productive_catalog(role_text)
+        allowed = [x.lower() for x in catalog.get("apps", [])]
+        productive_sec = 0
+        ocio_sec = 0
+        neutral_sec = 0
+
+        for app, sec in app_secs.items():
+            low = (app or "").lower()
+            if any(k in low for k in DISTRACTION_KEYWORDS):
+                ocio_sec += sec
+            elif any(k in low for k in allowed):
+                productive_sec += sec
+            else:
+                neutral_sec += sec
+
+        observed = productive_sec + ocio_sec + neutral_sec
+        rubric = self._adv_expected_rubric_seconds()
+        expected_total = float(rubric.get("total", 28800))
+
+        productive_ratio = productive_sec / max(1.0, observed)
+        ocio_penalty = ocio_sec / max(1.0, observed)
+        workload_ratio = min(1.15, observed / max(1.0, expected_total))
+
+        score = (productive_ratio * 0.70) + (workload_ratio * 0.25) - (ocio_penalty * 0.35)
+        return max(0.20, min(0.98, score))
+
     def _adv_export_analysis(self):
         try:
             from fpdf import FPDF
@@ -2395,12 +2497,19 @@ class PerfomanceView(ctk.CTkFrame):
                 if os.getenv("OPENAI_API_KEY"):
                     from openai import OpenAI
                     client = OpenAI(timeout=25)
+                    rubric = self._adv_expected_rubric_seconds()
                     prompt = (
-                        "Genera un resumen ejecutivo breve del rendimiento diario. "
-                        "Incluye: (1) si el resultado es normal/esperable, "
-                        "(2) actividades concretas que bajan rendimiento, "
-                        "(3) si el análisis de capturas/IA aporta señales relevantes, "
-                        "(4) recomendaciones accionables.\n\n"
+                        "Genera un resumen ejecutivo del rendimiento diario por persona y global. "
+                        "Mide el tiempo invertido por web/app y compáralo con objetivo de 3 expedientes/día. "
+                        f"Rubrica objetivo total: {rubric.get('total', 28800)}s/día (8h). "
+                        f"Desglose: atención {rubric.get('atencion_cliente')}s, presupuesto {rubric.get('presupuesto')}s, cobro {rubric.get('cobro')}s, operativa {rubric.get('operativa')}s, tarjeta {rubric.get('tarjeta_embarque')}s, administración {rubric.get('administracion')}s. "
+                        "Clasifica por rol y considera productivas (ejemplos): "
+                        "Operativa -> kommo, amadeus/sabre/travelport, webs aerolíneas, activex, csdviajes; "
+                        "Ventas -> kommo, amadeus, centralita/telefonía (3cx/aircall/dialpad); "
+                        "Dirección -> casi todas salvo ocio explícito; "
+                        "Administración -> bancos, facturación/contabilidad, calculadora, kommo. "
+                        "Incluye: (1) desvío de tiempo esperado por rol, (2) apps concretas que bajan rendimiento, "
+                        "(3) señales de capturas/IA, (4) recomendaciones accionables.\n\n"
                         + "\n".join(lines)
                     )
                     resp = client.responses.create(
@@ -2667,18 +2776,30 @@ class PerfomanceView(ctk.CTkFrame):
             eur_h = float((user_obj.get("eur_per_hour") or 0.0) if isinstance(user_obj, dict) else 0.0)
             mode = (self.adv_kpi_mode or "general").lower()
 
+            rubric = self._adv_expected_rubric_seconds()
+            role_meta = self._adv_role_productive_catalog(role_txt)
+            app_map = self._adv_extract_app_seconds(raw)
+            top_apps = sorted(app_map.items(), key=lambda x: x[1], reverse=True)[:18]
+            top_apps_txt = "\n".join([f"- {a}: {self.format_seconds(sec)}" for a, sec in top_apps])
+
             user_prompt = (
                 f"Usuario: {username}\n"
                 f"Fecha: {day}\n"
                 f"Modo KPI: {mode}\n"
                 f"Rol/Tareas esperadas: {role_txt}\n"
-                f"Pago por hora: {eur_h:.2f} €/h\n\n"
-                "Historial RAW:\n"
+                f"Pago por hora: {eur_h:.2f} €/h\n"
+                f"Rubrica diaria objetivo: {rubric.get('expedientes_dia', 3)} expedientes, total {rubric.get('total', 28800)}s (8h).\n"
+                f"Desglose objetivo (s): atencion={rubric.get('atencion_cliente')}, presupuesto={rubric.get('presupuesto')}, cobro={rubric.get('cobro')}, operativa={rubric.get('operativa')}, tarjeta={rubric.get('tarjeta_embarque')}, admin={rubric.get('administracion')}\n"
+                f"Apps productivas esperadas por rol {role_meta.get('role')}: {', '.join(role_meta.get('apps', [])[:80])}\n\n"
+                "Top apps por tiempo del historial:\n"
+                f"{top_apps_txt or '- Sin datos'}\n\n"
+                "Historial RAW completo:\n"
                 f"{raw}\n\n"
-                "Criterio:\n"
+                "Criterio de puntuación:\n"
                 "- No des 100, nadie es perfecto. Máximo 98.\n"
-                "- En modo 'tasks', premiar alineación con rol/tareas y castigar desvíos.\n"
-                "- En modo 'salary', ser más estricto cuanto mayor sea €/h.\n"
+                "- En modo tasks, medir productividad por TIEMPO en apps/webs alineadas al rol y por cumplimiento de carga esperada de 3 expedientes/día.\n"
+                "- Penalizar tiempo en ocio y desvíos de rol.\n"
+                "- En modo salary, ser más estricto cuanto mayor sea €/h.\n"
                 "- 50 = mezcla fuerte de productivo y ocio/dispersión.\n"
                 "- 20 = muy poco productivo.\n"
                 "Devolvé SOLO el número entero 1..98.\n"
@@ -3072,9 +3193,11 @@ class PerfomanceView(ctk.CTkFrame):
         raw = self._adv_get_user_raw_for_ai(username)
 
         if mode == "tasks":
-            role_score = self._adv_role_alignment_score((u.get("role") if isinstance(u, dict) else ""), raw)
+            role_txt = (u.get("role") if isinstance(u, dict) else "")
+            role_score = self._adv_role_alignment_score(role_txt, raw)
             role_ratio = role_score / 100.0
-            out = (base_ratio * 0.45) + (ai_ratio * 0.35) + (role_ratio * 0.20)
+            tasks_ratio = self._adv_tasks_mode_ratio(role_txt, raw)
+            out = (base_ratio * 0.30) + (ai_ratio * 0.30) + (role_ratio * 0.15) + (tasks_ratio * 0.25)
         elif mode == "salary":
             eur_h = float((u.get("eur_per_hour") if isinstance(u, dict) else 0.0) or 0.0)
             strict_target = min(0.95, 0.68 + (eur_h / 200.0))
