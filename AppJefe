@@ -1333,6 +1333,8 @@ class PerfomanceView(ctk.CTkFrame):
         self._ai_log_meta = ""  # “user/date”
         self.on_ai_chat = None  # callback opcional si lo querés desde master
         self._ai_chat_history = []  # lista de (role, text)
+        self._ai_threads = []
+        self._pv_closing = False
 
         self.max_width = max_width
         self.max_height = max_height
@@ -1781,6 +1783,32 @@ class PerfomanceView(ctk.CTkFrame):
         except Exception:
             return False
 
+
+    def _start_ai_thread(self, target, args=()):
+        try:
+            t = threading.Thread(target=target, args=args, daemon=True)
+            self._ai_threads.append(t)
+            t.start()
+            return t
+        except Exception:
+            return None
+
+    def _shutdown_async_workers(self):
+        self._pv_closing = True
+        try:
+            self._ai_pending_req_id = None
+        except Exception:
+            pass
+        alive = []
+        for t in list(getattr(self, "_ai_threads", []) or []):
+            try:
+                if t and t.is_alive() and t is not threading.current_thread():
+                    t.join(timeout=0.4)
+                    if t.is_alive():
+                        alive.append(t)
+            except Exception:
+                pass
+        self._ai_threads = alive
 
     def setup_ai_tools_tab(self):
         tab = self.tabview.tab("Herramientas IA")
@@ -2787,11 +2815,7 @@ class PerfomanceView(ctk.CTkFrame):
         if len(raw) > 12000:
             raw = raw[-12000:]
 
-        threading.Thread(
-            target=self._adv_ai_eff_worker,
-            args=(username, day, raw),
-            daemon=True
-        ).start()
+        self._start_ai_thread(self._adv_ai_eff_worker, (username, day, raw))
 
     def _adv_ai_eff_worker(self, username: str, day: str, raw: str):
         score = None
@@ -2873,6 +2897,8 @@ class PerfomanceView(ctk.CTkFrame):
             score = 98
 
         def ui():
+            if getattr(self, "_pv_closing", False):
+                return
             for u in self.adv_users:
                 if u.get("name") == username:
                     u["ai_eff"] = score
@@ -3366,12 +3392,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         self._safe_after_ui(lambda rid=req_id: self.after(45000, lambda: _watchdog(rid)))
 
-        import threading
-        threading.Thread(
-            target=self._ai_chat_worker_pro,
-            args=(q, context, req_id),
-            daemon=True
-        ).start()
+        self._start_ai_thread(self._ai_chat_worker_pro, (q, context, req_id))
 
     def _ai_chat_worker_pro(self, question: str, context: str, req_id: int):
         """
@@ -3426,6 +3447,8 @@ class PerfomanceView(ctk.CTkFrame):
 
         def ui():
             try:
+                if getattr(self, "_pv_closing", False):
+                    return
                 if getattr(self, "_ai_pending_req_id", None) not in (None, req_id):
                     return
                 self._ai_pending_req_id = None
@@ -6378,8 +6401,51 @@ class KClientApp(ctk.CTk):
 
         self.btn_login = None
 
+    def _prepare_widget_for_destroy(self, w):
+        try:
+            if hasattr(w, "winfo_children"):
+                for c in w.winfo_children() or []:
+                    self._prepare_widget_for_destroy(c)
+        except Exception:
+            pass
+        try:
+            if hasattr(w, "configure"):
+                cfg = w.configure()
+                if "image" in cfg:
+                    try:
+                        w.configure(image="")
+                    except Exception:
+                        pass
+                if "textvariable" in cfg:
+                    try:
+                        w.configure(textvariable="")
+                    except Exception:
+                        pass
+                if "variable" in cfg:
+                    try:
+                        w.configure(variable="")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        for attr in ("image", "_img_tk", "_tk_image"):
+            try:
+                if hasattr(w, attr):
+                    setattr(w, attr, None)
+            except Exception:
+                pass
+
     def _clear_main_holder(self):
         for w in self.main_holder.winfo_children():
+            try:
+                if hasattr(w, "_shutdown_async_workers"):
+                    w._shutdown_async_workers()
+            except Exception:
+                pass
+            try:
+                self._prepare_widget_for_destroy(w)
+            except Exception:
+                pass
             w.destroy()
 
     def _view_settings(self):
@@ -8520,10 +8586,19 @@ class KClientApp(ctk.CTk):
             pass
 
         # 4) cerrar ventanas hijas si existen
+        try:
+            pv = getattr(self, "perf_view", None)
+            if pv is not None and pv.winfo_exists() and hasattr(pv, "_shutdown_async_workers"):
+                pv._shutdown_async_workers()
+                self._prepare_widget_for_destroy(pv)
+        except Exception:
+            pass
+
         for w_attr in ("perf_win", "gallery_win"):
             try:
                 w = getattr(self, w_attr, None)
                 if w is not None and w.winfo_exists():
+                    self._prepare_widget_for_destroy(w)
                     w.destroy()
             except Exception:
                 pass
