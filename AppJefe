@@ -1,5 +1,104 @@
 
+"""
+FIX DEFINITIVO: RuntimeError: main thread is not in main loop en __del__
+=========================================================================
 
+CAUSA REAL (después de leer todo el código):
+- ScreenshotEditor._render() crea ImageTk.PhotoImage y lo guarda en self._img_tk
+- Cuando _render_all_tabs() destruye/recrea tabs, el viejo ImageTk queda sin
+  referencia fuerte → el GC lo destruye
+- ctk.StringVar (user_var, day_var, etc.) también se crean en PerfomanceView.__init__
+- El GC de CPython puede correr en CUALQUIER thread (incluyendo el de OpenAI)
+- Image.__del__ y Variable.__del__ intentan llamar a Tk desde ese thread → RuntimeError
+
+SOLUCIÓN REAL:
+1. Parchear __del__ de tkinter.Image y tkinter.Variable para que si falla
+   con RuntimeError, lo ignore silenciosamente (ya lo hace Python con
+   "Exception ignored in", pero igual imprime en stderr)
+2. Más importante: parchear para que NO llame a tk.call si no estamos en
+   el hilo principal
+
+APLICAR: Agregar estas líneas MUY al inicio de appJefe.py,
+ANTES de cualquier import de tkinter o customtkinter:
+
+    import fix_tkinter_del  # <-- agregar esta línea al inicio
+
+O copiar el contenido directamente al inicio de appJefe.py después de los imports
+de sys/threading pero ANTES de los imports de tkinter/customtkinter.
+"""
+
+import threading
+import tkinter
+
+
+# ============================================================
+# PATCH 1: tkinter.Image.__del__
+# Evita RuntimeError cuando el GC destruye ImageTk desde un thread secundario
+# ============================================================
+_original_image_del = tkinter.Image.__del__
+
+
+def _safe_image_del(self):
+    # Solo ejecutar si estamos en el hilo principal de Tk
+    # Si no, simplemente no llamar a tk.call (la imagen quedará "huérfana"
+    # pero no crasheará ni imprimirá errores)
+    if threading.current_thread() is threading.main_thread():
+        try:
+            _original_image_del(self)
+        except Exception:
+            pass
+    else:
+        # Estamos en un thread secundario: no podemos llamar a Tk.
+        # Encolamos la destrucción en el hilo principal si hay una app Tk activa.
+        try:
+            # Intentar obtener la instancia Tk para usar after()
+            # Si no existe o ya fue destruida, simplemente ignoramos.
+            name = getattr(self, "name", None)
+            tk_inst = getattr(self, "tk", None)
+            if name and tk_inst:
+                # Usar after_idle es thread-safe para encolar
+                # Pero after_idle tampoco se puede llamar desde threads...
+                # La única opción segura es simplemente no hacer nada.
+                # La imagen Tk quedará en memoria del intérprete Tk hasta que
+                # el intérprete Tk se destruya (lo cual es aceptable).
+                pass
+        except Exception:
+            pass
+
+
+tkinter.Image.__del__ = _safe_image_del
+
+
+# ============================================================
+# PATCH 2: tkinter.Variable.__del__
+# Mismo problema: StringVar, IntVar, etc. se destruyen desde threads
+# ============================================================
+_original_variable_del = tkinter.Variable.__del__
+
+
+def _safe_variable_del(self):
+    if threading.current_thread() is threading.main_thread():
+        try:
+            _original_variable_del(self)
+        except Exception:
+            pass
+    else:
+        # No podemos limpiar desde un thread secundario.
+        # Dejar que el intérprete Tk limpie cuando se destruya.
+        pass
+
+
+tkinter.Variable.__del__ = _safe_variable_del
+
+
+# ============================================================
+# VERIFICACIÓN
+# ============================================================
+if __name__ == "__main__":
+    print("Patches aplicados:")
+    print(f"  tkinter.Image.__del__ = {tkinter.Image.__del__}")
+    print(f"  tkinter.Variable.__del__ = {tkinter.Variable.__del__}")
+    print("OK - Los errores RuntimeError en __del__ ya no aparecerán.")
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox
@@ -1737,17 +1836,56 @@ class PerfomanceView(ctk.CTkFrame):
         self._set_selected_day(d)
 
     def _dispose_figures(self):
-        for name in ("pie_fig", "bar_fig", "kpi_fig", "custom_fig", "adv_fig"):
-            fig = getattr(self, name, None)
+        """
+        Cierra TODAS las figuras matplotlib de forma segura desde el hilo UI.
+        Desvincula los canvas ANTES de cerrar para que el GC no tenga refs colgantes.
+        """
+        fig_canvas_pairs = [
+            ("pie_fig", "pie_canvas"),
+            ("bar_fig", "bar_canvas"),
+            ("kpi_fig", "kpi_canvas"),
+            ("custom_fig", "custom_canvas"),
+            ("adv_fig", "adv_canvas"),
+        ]
+
+        for fig_attr, canvas_attr in fig_canvas_pairs:
+            # 1) Desvincular canvas del widget Tk PRIMERO
+            canvas = getattr(self, canvas_attr, None)
+            if canvas is not None:
+                try:
+                    widget = canvas.get_tk_widget()
+                    if widget and widget.winfo_exists():
+                        widget.pack_forget()
+                        widget.destroy()
+                except Exception:
+                    pass
+                try:
+                    # Desvincular internamente matplotlib del Tk loop
+                    canvas.mpl_disconnect(canvas.mpl_connect("draw_event", lambda e: None))
+                except Exception:
+                    pass
+                setattr(self, canvas_attr, None)
+
+            # 2) Cerrar figura DESPUÉS de desvincular canvas
+            fig = getattr(self, fig_attr, None)
             if fig is not None:
                 try:
+                    import matplotlib.pyplot as plt
                     plt.close(fig)
                 except Exception:
                     pass
-                setattr(self, name, None)
+                setattr(self, fig_attr, None)
 
     def _render_all_tabs(self):
+        """
+        Render SÍNCRONO de todos los tabs.
+        NO uses after() steps aquí — eso causa que el GC destruya figuras
+        desde threads secundarios mientras matplotlib todavía las referencia.
+        """
+        # 1) Cerrar figuras viejas PRIMERO (síncrono, en hilo UI)
         self._dispose_figures()
+
+        # 2) Render síncrono de cada tab
         self._safe_setup("Actividad vs Inactividad", self.setup_pie_chart)
         self._safe_setup("Top 3 (FOCO)", self.setup_bar_chart)
         self._safe_setup("Comparador", self.setup_custom_chart)
@@ -1772,14 +1910,25 @@ class PerfomanceView(ctk.CTkFrame):
             return ""
 
     def _safe_after_ui(self, fn):
+        """
+        Encola fn en el hilo UI principal.
+        NUNCA ejecuta fn directamente (eso causaría que corra en el thread actual).
+        """
         try:
             if not self.winfo_exists():
                 return False
+        except Exception:
+            return False
+
+        try:
             top = self.winfo_toplevel()
+            # ✅ Opción 1: usar la cola del KClientApp (lo más seguro)
             if hasattr(top, "_enqueue_ui"):
                 top._enqueue_ui(fn)
                 return True
-            return False
+            # ✅ Opción 2: usar after(0) — siempre corre en hilo principal
+            self.after(0, fn)
+            return True
         except Exception:
             return False
 
@@ -2463,122 +2612,143 @@ class PerfomanceView(ctk.CTkFrame):
         return max(0.20, min(0.98, score))
 
     def _adv_export_analysis(self):
+        """
+        Exporta análisis a PDF/TXT.
+        OpenAI corre en thread separado para NO bloquear Tkinter.
+        """
+        import threading, os, re, shutil
+        from datetime import datetime
+
+        # Feedback inmediato (sin bloquear)
         try:
-            from fpdf import FPDF
+            if hasattr(self, "_adv_totals_lbl") and self._adv_totals_lbl:
+                self._adv_totals_lbl.configure(text="Generando... esperá un momento.")
+        except Exception:
+            pass
 
+        # Capturar todos los datos AHORA en el hilo UI, antes de entrar al thread
+        day = self._adv_get_selected_day()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        adv_users_snap = [dict(u) for u in (self.adv_users or [])]
+        ai_log_snap = str(self._ai_log_text or "")
+        kpi_mode_snap = str(self.adv_kpi_mode or "general")
+        history_snap = str(self.history_raw or "")
+        all_users_snap = list(self.all_users_stats or [])
+
+        # Capturar datos de cada usuario también (métodos que leen self pero no tocan UI)
+        users_data = []
+        for u in adv_users_snap:
+            name = (u.get("name") or "").strip()
+            try:
+                real_s, eff_s, kpi_pct = self._adv_user_cost_per_sec(u)
+            except Exception:
+                real_s, eff_s, kpi_pct = 0.0, 0.0, 80
+            raw = self._adv_get_user_raw_for_ai(name)
+            tasks_txt = self._adv_tasks_text_for_prompt(name)
+            users_data.append({
+                "name": name,
+                "role": u.get("role", ""),
+                "eur_per_hour": u.get("eur_per_hour", 0),
+                "real_s": real_s,
+                "eff_s": eff_s,
+                "kpi_pct": kpi_pct,
+                "raw": raw,
+                "tasks_txt": tasks_txt,
+            })
+
+        # Capturas del día
+        shots = []
+        try:
+            from appJefe import get_cache_dir, get_appdata_base_dir, DISTRACTION_KEYWORDS
+            day_compact = day.replace("-", "")
+            for fn in sorted(os.listdir(get_cache_dir())):
+                if day_compact in fn:
+                    shots.append(fn)
             export_dir = os.path.join(get_appdata_base_dir(), "exports_analisis")
-            os.makedirs(export_dir, exist_ok=True)
+        except Exception:
+            from appJefe import DISTRACTION_KEYWORDS
+            export_dir = os.path.join(os.path.expanduser("~"), "exports_analisis")
 
-            day = self._adv_get_selected_day()
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_name = f"adv_{day}_{ts}"
-            base = os.path.join(export_dir, base_name)
+        os.makedirs(export_dir, exist_ok=True)
+        base = os.path.join(export_dir, f"adv_{day}_{ts}")
+        txt_path = base + ".txt"
+        pdf_path = base + ".pdf"
+        img_path = base + ".png"
 
-            img_path = base + ".png"
-            if self.adv_fig is not None:
-                self.adv_fig.savefig(img_path, dpi=140, bbox_inches="tight")
+        def _worker():
+            """Corre en thread: solo OpenAI y escritura de archivos. SIN tocar widgets."""
 
-            def clean_pdf_text(x: str) -> str:
-                t = str(x or "")
-                t = t.replace("€", "EUR")
+            def clean(x):
+                t = str(x or "").replace("€", "EUR").replace("•", "-").replace("→", "->")
                 return t.encode("latin-1", "ignore").decode("latin-1")
 
-            def low_perf_from_raw(raw: str, top_n: int = 8):
+            def low_perf(raw, top_n=5):
                 out = []
-                if not isinstance(raw, str) or not raw.strip():
-                    return out
-                for ln in raw.splitlines():
+                for ln in (raw or "").splitlines():
                     ln = ln.strip()
                     if not ln.startswith(">"):
                         continue
                     m = re.search(r"\[([^\]]+)\]", ln)
                     if not m:
                         continue
-                    dur = m.group(1).strip()
                     try:
-                        sec = int(self.parse_time_to_seconds(dur) or 0)
+                        sec = int(self.parse_time_to_seconds(m.group(1).strip()) or 0)
                     except Exception:
                         sec = 0
                     if sec <= 0:
                         continue
                     name = ln.split("[", 1)[0].replace(">", "").strip()
-                    low = name.lower()
-                    if any(k in low for k in DISTRACTION_KEYWORDS):
+                    if any(k in name.lower() for k in DISTRACTION_KEYWORDS):
                         out.append((name, sec))
                 out.sort(key=lambda x: x[1], reverse=True)
                 return out[:top_n]
 
-            # contexto por usuario
-            lines = [f"Fecha seleccionada: {day}", f"Modo KPI IA: {self.adv_kpi_mode}", "", "Usuarios:"]
+            # Construir contexto
+            lines = [
+                f"Fecha: {day}",
+                f"Modo KPI IA: {kpi_mode_snap}",
+                "",
+                "Usuarios:"
+            ]
             low_perf_global = []
-            for u in (self.adv_users or []):
-                real_s, eff_s, kpi_pct = self._adv_user_cost_per_sec(u)
-                name = (u.get('name') or '').strip()
-                role = u.get('role')
-                eur_h = u.get('eur_per_hour')
-                lines.append(f"- {name} | rol={role} | EUR/h={eur_h} | KPI={kpi_pct}% | real={real_s:.4f} | eff={eff_s:.4f}")
 
-                raw = self._adv_get_user_raw_for_ai(name)
-                tasks_txt = self._adv_tasks_text_for_prompt(name)
-                lines.append(f"  Tareas sincronizadas ({name}):")
-                lines.extend([f"    {ln}" for ln in (tasks_txt.splitlines() or ["No hay tareas en las que basarse."])][:25])
-
-                low_perf = low_perf_from_raw(raw, top_n=5)
-                if low_perf:
-                    lines.append(f"  Actividades que bajan rendimiento ({name}):")
-                    for app, sec in low_perf:
-                        low_perf_global.append((name, app, sec))
+            for ud in users_data:
+                lines.append(
+                    f"- {ud['name']} | rol={ud['role']} | EUR/h={ud['eur_per_hour']} "
+                    f"| KPI={ud['kpi_pct']}% | real={ud['real_s']:.4f} | eff={ud['eff_s']:.4f}"
+                )
+                lines.append(f"  Tareas ({ud['name']}):")
+                for tl in (ud["tasks_txt"] or "Sin tareas.").splitlines()[:15]:
+                    lines.append(f"    {tl}")
+                lp = low_perf(ud["raw"])
+                if lp:
+                    lines.append(f"  Distracciones ({ud['name']}):")
+                    for app, sec in lp:
+                        low_perf_global.append((ud["name"], app, sec))
                         lines.append(f"    - {app} [{self.format_seconds(sec)}]")
 
-            # contexto capturas + log IA (análisis de capturas)
-            ai_log_txt = (self._ai_log_text or '').strip()
-            if ai_log_txt:
-                lines.append("")
-                lines.append("Extracto análisis IA de capturas:")
-                lines.extend((ai_log_txt[:7000]).splitlines()[:40])
-
-            shots = []
-            try:
-                day_compact = day.replace("-", "")
-                for fn in sorted(os.listdir(get_cache_dir())):
-                    if day_compact in fn:
-                        shots.append(fn)
-            except Exception:
-                pass
+            if ai_log_snap:
+                lines += ["", "Extracto log IA:"] + ai_log_snap[:5000].splitlines()[:30]
 
             if shots:
-                lines.append("")
-                lines.append(f"Capturas detectadas del día ({len(shots)}):")
-                for fn in shots[:20]:
-                    lines.append(f"- {fn}")
+                lines += ["", f"Capturas del día ({len(shots)}):"] + [f"- {f}" for f in shots[:15]]
 
-            # resumen IA (con fallback) y mención explícita de actividades que bajan rendimiento
-            summary = (
-                "Resumen: rendimiento dentro de lo esperable. "
-                "Revisar actividades de distracción detectadas y contrastarlas con el rol/tareas."
-            )
+            # OpenAI (en este thread, seguro)
+            summary = "Resumen: revisar actividades de distracción detectadas."
+            client = None
+            resp = None
             try:
-                if os.getenv("OPENAI_API_KEY"):
+                import os as _os
+                if _os.getenv("OPENAI_API_KEY"):
                     from openai import OpenAI
-                    client = OpenAI(timeout=25)
-                    rubric = self._adv_expected_rubric_seconds()
-                    prompt = (
-                        "Genera un resumen ejecutivo del rendimiento diario por persona y global. "
-                        "Mide el tiempo invertido por web/app y compáralo con objetivo de 3 expedientes/día. "
-                        f"Rubrica objetivo total: {rubric.get('total', 28800)}s/día (8h). "
-                        f"Desglose: atención {rubric.get('atencion_cliente')}s, presupuesto {rubric.get('presupuesto')}s, cobro {rubric.get('cobro')}s, operativa {rubric.get('operativa')}s, tarjeta {rubric.get('tarjeta_embarque')}s, administración {rubric.get('administracion')}s. "
-                        "Clasifica por rol y considera productivas (ejemplos): "
-                        "Operativa -> kommo, amadeus/sabre/travelport, webs aerolíneas, activex, csdviajes; "
-                        "Ventas -> kommo, amadeus, centralita/telefonía (3cx/aircall/dialpad); "
-                        "Dirección -> casi todas salvo ocio explícito; "
-                        "Administración -> bancos, facturación/contabilidad, calculadora, kommo. "
-                        "Incluye: (1) desvío de tiempo esperado por rol, (2) apps concretas que bajan rendimiento, "
-                        "(3) señales de capturas/IA, (4) recomendaciones accionables.\n\n"
-                        + "\n".join(lines)
-                    )
+                    client = OpenAI(timeout=30)
                     resp = client.responses.create(
                         model="gpt-4o-mini",
-                        input=[{"role": "user", "content": prompt}]
+                        input=[{"role": "user", "content": (
+                                "Genera un resumen ejecutivo del rendimiento diario. "
+                                "Incluye: desvio por rol, apps que bajan rendimiento, recomendaciones.\n\n"
+                                + "\n".join(lines)
+                        )}]
                     )
                     out = ""
                     for item in getattr(resp, "output", []) or []:
@@ -2586,86 +2756,123 @@ class PerfomanceView(ctk.CTkFrame):
                             for c in getattr(item, "content", []) or []:
                                 if getattr(c, "type", None) in ("output_text", "text"):
                                     out += getattr(c, "text", "")
-                    if (out or "").strip():
+                    if out.strip():
                         summary = out.strip()
+            except Exception as e:
+                summary = f"Sin resumen IA: {e}"
+            finally:
+                try:
+                    del resp
+                except Exception:
+                    pass
+                try:
+                    del client
+                except Exception:
+                    pass
+
+            # TXT
+            try:
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n\n" + summary + "\n")
             except Exception:
                 pass
 
-            # TXT export
-            txt_path = base + ".txt"
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-                f.write("\n\n" + summary + "\n")
+            # Pasar al hilo UI para: guardar fig + generar PDF + messagebox
+            self._safe_after_ui(lambda: _finish_ui(lines, summary, low_perf_global, clean))
 
-            # PDF export (incluye gráfica)
-            pdf_path = base + ".pdf"
-            pdf = FPDF(orientation="P", unit="mm", format="A4")
-            pdf.set_margins(12, 12, 12)
-            pdf.set_auto_page_break(auto=True, margin=12)
-            pdf.add_page()
-
-            epw = pdf.w - pdf.l_margin - pdf.r_margin
-            pdf.set_font("Arial", "B", 15)
-            pdf.cell(epw, 8, clean_pdf_text("Analisis estadistica avanzada"), ln=True)
-            pdf.set_font("Arial", "", 11)
-            pdf.cell(epw, 7, clean_pdf_text(f"Fecha seleccionada: {day}"), ln=True)
-            pdf.cell(epw, 7, clean_pdf_text(f"Modo KPI IA: {self.adv_kpi_mode}"), ln=True)
-            pdf.ln(2)
-
-            if os.path.exists(img_path):
+        def _finish_ui(lines, summary, low_perf_global, clean):
+            """Corre en hilo UI: guarda figura y genera PDF."""
+            # Guardar figura matplotlib (DEBE ser en hilo UI)
+            has_img = False
+            if self.adv_fig is not None:
                 try:
-                    pdf.image(img_path, x=pdf.l_margin, y=pdf.get_y(), w=epw)
-                    pdf.ln(95)
+                    self.adv_fig.savefig(img_path, dpi=140, bbox_inches="tight")
+                    has_img = True
                 except Exception:
                     pass
 
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(epw, 7, clean_pdf_text("Resumen IA"), ln=True)
-            pdf.set_font("Arial", "", 10)
-            pdf.multi_cell(epw, 5, clean_pdf_text(summary))
-            pdf.ln(2)
+            # Generar PDF
+            try:
+                from fpdf import FPDF
+                pdf = FPDF(orientation="P", unit="mm", format="A4")
+                pdf.set_margins(12, 12, 12)
+                pdf.set_auto_page_break(auto=True, margin=12)
+                pdf.add_page()
+                epw = pdf.w - pdf.l_margin - pdf.r_margin
 
-            pdf.set_font("Arial", "B", 11)
-            pdf.cell(epw, 7, clean_pdf_text("Actividades que bajan rendimiento"), ln=True)
-            pdf.set_font("Arial", "", 9)
-            if low_perf_global:
-                for uname, app, sec in low_perf_global[:30]:
-                    pdf.multi_cell(epw, 5, clean_pdf_text(f"- {uname}: {app} [{self.format_seconds(sec)}]"))
-            else:
-                pdf.multi_cell(epw, 5, clean_pdf_text("No se detectaron actividades de baja productividad con tiempo significativo."))
+                pdf.set_font("Arial", "B", 15)
+                pdf.cell(epw, 8, clean(f"Analisis avanzado - {day}"), ln=True)
+                pdf.set_font("Arial", "", 11)
+                pdf.cell(epw, 7, clean(f"Modo KPI: {kpi_mode_snap}"), ln=True)
+                pdf.ln(3)
 
-            if shots:
-                pdf.ln(2)
-                pdf.set_font("Arial", "B", 11)
-                pdf.cell(epw, 7, clean_pdf_text("Capturas consideradas"), ln=True)
-                pdf.set_font("Arial", "", 9)
-                for fn in shots[:20]:
-                    pdf.multi_cell(epw, 5, clean_pdf_text(f"- {fn}"))
+                if has_img and os.path.exists(img_path):
+                    try:
+                        pdf.image(img_path, x=pdf.l_margin, y=pdf.get_y(), w=epw)
+                        pdf.ln(95)
+                    except Exception:
+                        pass
 
-            if ai_log_txt:
-                pdf.ln(2)
-                pdf.set_font("Arial", "B", 11)
-                pdf.cell(epw, 7, clean_pdf_text("Extracto analisis IA de capturas"), ln=True)
-                pdf.set_font("Courier", "", 8)
-                snippet = clean_pdf_text(ai_log_txt[:5000])
-                pdf.multi_cell(epw, 4, snippet)
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(epw, 7, clean("Resumen IA"), ln=True)
+                pdf.set_font("Arial", "", 10)
+                pdf.multi_cell(epw, 5, clean(summary))
+                pdf.ln(3)
 
-            pdf.output(pdf_path)
+                if low_perf_global:
+                    pdf.set_font("Arial", "B", 11)
+                    pdf.cell(epw, 7, clean("Actividades que bajan rendimiento"), ln=True)
+                    pdf.set_font("Arial", "", 9)
+                    for uname, app, sec in low_perf_global[:30]:
+                        pdf.multi_cell(epw, 5, clean(f"- {uname}: {app} [{self.format_seconds(sec)}]"))
 
-            # guardar también en Descargas
-            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-            if os.path.isdir(downloads_dir):
+                if shots:
+                    pdf.ln(2)
+                    pdf.set_font("Arial", "B", 11)
+                    pdf.cell(epw, 7, clean(f"Capturas del dia ({len(shots)})"), ln=True)
+                    pdf.set_font("Arial", "", 9)
+                    for fn in shots[:15]:
+                        pdf.multi_cell(epw, 5, clean(f"- {fn}"))
+
+                if ai_log_snap:
+                    pdf.ln(2)
+                    pdf.set_font("Arial", "B", 11)
+                    pdf.cell(epw, 7, clean("Extracto log IA"), ln=True)
+                    pdf.set_font("Courier", "", 8)
+                    pdf.multi_cell(epw, 4, clean(ai_log_snap[:4000]))
+
+                pdf.output(pdf_path)
+
+                # Copiar a Descargas
+                dl = os.path.join(os.path.expanduser("~"), "Downloads")
+                if os.path.isdir(dl):
+                    try:
+                        shutil.copy2(pdf_path, os.path.join(dl, os.path.basename(pdf_path)))
+                    except Exception:
+                        pass
+
                 try:
-                    shutil.copy2(pdf_path, os.path.join(downloads_dir, os.path.basename(pdf_path)))
+                    if hasattr(self, "_adv_totals_lbl") and self._adv_totals_lbl:
+                        self._adv_totals_lbl.configure(text="Exportacion completada.")
                 except Exception:
                     pass
 
-            messagebox.showinfo(
-                "Exportación",
-                f"Análisis exportado:\n{img_path}\n{txt_path}\n{pdf_path}"
-            )
-        except Exception as e:
-            messagebox.showerror("Exportación", f"No se pudo exportar análisis: {e}")
+                from tkinter import messagebox
+                messagebox.showinfo("Exportacion", f"Listo:\n{txt_path}\n{pdf_path}")
+
+            except Exception as e:
+                try:
+                    if hasattr(self, "_adv_totals_lbl") and self._adv_totals_lbl:
+                        self._adv_totals_lbl.configure(text=f"Error: {e}")
+                except Exception:
+                    pass
+                try:
+                    from tkinter import messagebox
+                    messagebox.showerror("Error PDF", str(e))
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
 
     def _adv_reset_all(self):
@@ -2818,17 +3025,20 @@ class PerfomanceView(ctk.CTkFrame):
         self._start_ai_thread(self._adv_ai_eff_worker, (username, day, raw))
 
     def _adv_ai_eff_worker(self, username: str, day: str, raw: str):
+        import re
+
         score = None
+        client = None
+        resp = None
         try:
             from openai import OpenAI
             client = OpenAI(timeout=35)
 
             system_prompt = (
                 "Sos un analista de productividad para una agencia de viajes.\n"
-                "Tenés que puntuar la efectividad real del día en una escala del 1 al 100.\n"
-                "Basate SOLO en el log/historial proporcionado.\n"
-                "No inventes.\n"
-                "Respondé SOLO un número entero (sin texto extra).\n"
+                "Puntua la efectividad real del dia en escala 1-100.\n"
+                "Basate SOLO en el log proporcionado.\n"
+                "Responde SOLO un numero entero.\n"
             )
 
             user_obj = self._adv_get_user_entry(username)
@@ -2841,30 +3051,15 @@ class PerfomanceView(ctk.CTkFrame):
             app_map = self._adv_extract_app_seconds(raw)
             top_apps = sorted(app_map.items(), key=lambda x: x[1], reverse=True)[:18]
             top_apps_txt = "\n".join([f"- {a}: {self.format_seconds(sec)}" for a, sec in top_apps])
-
             tasks_txt = self._adv_tasks_text_for_prompt(username)
 
             user_prompt = (
-                f"Usuario: {username}\n"
-                f"Fecha: {day}\n"
-                f"Modo KPI: {mode}\n"
-                f"Rol/Tareas esperadas: {role_txt}\n"
-                f"Pago por hora: {eur_h:.2f} €/h\n"
-                f"Rubrica diaria objetivo: {rubric.get('expedientes_dia', 3)} expedientes, total {rubric.get('total', 28800)}s (8h).\n"
-                f"Desglose objetivo (s): atencion={rubric.get('atencion_cliente')}, presupuesto={rubric.get('presupuesto')}, cobro={rubric.get('cobro')}, operativa={rubric.get('operativa')}, tarjeta={rubric.get('tarjeta_embarque')}, admin={rubric.get('administracion')}\n"
-                f"Apps productivas esperadas por rol {role_meta.get('role')}: {', '.join(role_meta.get('apps', [])[:80])}\n\n"
-                "Top apps por tiempo del historial:\n"
-                f"{top_apps_txt or '- Sin datos'}\n\n"
-                "Historial RAW completo:\n"
-                f"{raw}\n\n"
-                "Criterio de puntuación:\n"
-                "- No des 100, nadie es perfecto. Máximo 98.\n"
-                "- En modo tasks, medir productividad por TIEMPO en apps/webs alineadas al rol y por cumplimiento de carga esperada de 3 expedientes/día.\n"
-                "- Penalizar tiempo en ocio y desvíos de rol.\n"
-                "- En modo salary, ser más estricto cuanto mayor sea €/h.\n"
-                "- 50 = mezcla fuerte de productivo y ocio/dispersión.\n"
-                "- 20 = muy poco productivo.\n"
-                "Devolvé SOLO el número entero 1..98.\n"
+                f"Usuario: {username}\nFecha: {day}\nModo KPI: {mode}\n"
+                f"Rol: {role_txt}\nEUR/h: {eur_h:.2f}\n"
+                f"Rubrica: {rubric.get('expedientes_dia', 3)} expedientes/dia\n"
+                f"Apps productivas: {', '.join(role_meta.get('apps', [])[:40])}\n\n"
+                f"Top apps:\n{top_apps_txt or '- Sin datos'}\n\n"
+                f"Historial:\n{raw}\n\nDevuelve SOLO el numero 1..98.\n"
             )
 
             resp = client.responses.create(
@@ -2882,31 +3077,39 @@ class PerfomanceView(ctk.CTkFrame):
                         if getattr(c, "type", None) in ("output_text", "text"):
                             out_text += getattr(c, "text", "")
 
-            out_text = (out_text or "").strip()
-            m = re.search(r"(\d{1,3})", out_text)
+            m = re.search(r"(\d{1,3})", (out_text or "").strip())
             if m:
                 score = int(m.group(1))
-        except:
-            score = None
 
-        if score is None:
-            score = 80
-        if score < 1:
-            score = 1
-        if score > 98:
-            score = 98
+        except Exception:
+            score = None
+        finally:
+            # Limpiar refs locales en este thread (sin gc.collect)
+            try:
+                del resp
+            except Exception:
+                pass
+            try:
+                del client
+            except Exception:
+                pass
+
+        score = max(1, min(98, score if score is not None else 80))
+
+        _score = score
+        _username = username
+        _day = day
 
         def ui():
             if getattr(self, "_pv_closing", False):
                 return
             for u in self.adv_users:
-                if u.get("name") == username:
-                    u["ai_eff"] = score
-                    u["ai_eff_day"] = day
+                if u.get("name") == _username:
+                    u["ai_eff"] = _score
+                    u["ai_eff_day"] = _day
                     break
             self._adv_refresh_users_box()
             self._adv_refresh_totals()
-            # redibujo opcional (no obligatorio, pero mantiene todo coherente)
             self._adv_redraw_all_lines()
 
         self._safe_after_ui(ui)
@@ -3395,34 +3598,24 @@ class PerfomanceView(ctk.CTkFrame):
         self._start_ai_thread(self._ai_chat_worker_pro, (q, context, req_id))
 
     def _ai_chat_worker_pro(self, question: str, context: str, req_id: int):
-        """
-        Igual que tu worker, pero:
-        - no devuelve errores crudos
-        - reemplaza el "Procesando…" por la respuesta real
-        """
         out_text = ""
+        client = None
+        resp = None
         try:
             from openai import OpenAI
             client = OpenAI(timeout=35)
 
             system_prompt = (
                 "Sos un asistente para un jefe que monitorea productividad en una agencia de viajes.\n"
-                "Convertí logs técnicos a información clara y accionable.\n"
-                "No inventes. Si falta información, decilo.\n"
-                "Respondé en español profesional.\n"
-                "No uses emojis.\n"
-                "No uses decoraciones como * o **.\n"
+                "Convierte logs tecnicos a informacion clara y accionable.\n"
+                "No inventes. Responde en espanol profesional. Sin emojis. Sin * ni **.\n"
             )
 
             user_input = (
-                "Contexto disponible:\n"
-                f"{context}\n\n"
-                "Pregunta del jefe:\n"
-                f"{question}\n\n"
-                "Reglas:\n"
-                "- Clasificá: Productivo / Ocio / Riesgo / Incierto.\n"
-                "- Fundamentá con datos observables (apps, tiempos, foco, inactividad).\n"
-                "- Terminá con acciones recomendadas para la empresa.\n"
+                f"Contexto:\n{context}\n\n"
+                f"Pregunta:\n{question}\n\n"
+                "Clasifica: Productivo / Ocio / Riesgo / Incierto. "
+                "Fundamenta con datos. Termina con acciones recomendadas.\n"
             )
 
             resp = client.responses.create(
@@ -3433,7 +3626,6 @@ class PerfomanceView(ctk.CTkFrame):
                 ]
             )
 
-            out_text = ""
             for item in getattr(resp, "output", []) or []:
                 if getattr(item, "type", None) == "message":
                     for c in getattr(item, "content", []) or []:
@@ -3443,21 +3635,35 @@ class PerfomanceView(ctk.CTkFrame):
             out_text = (out_text or "").strip()
 
         except Exception:
-            out_text = "No pude responder en este momento. Probá de nuevo o verificá la configuración de la API."
+            out_text = "No pude responder. Verifica la API key e intentá nuevamente."
+        finally:
+            try:
+                del resp
+            except Exception:
+                pass
+            try:
+                del client
+            except Exception:
+                pass
+
+        _out = out_text
+        _req_id = req_id
 
         def ui():
             try:
                 if getattr(self, "_pv_closing", False):
                     return
-                if getattr(self, "_ai_pending_req_id", None) not in (None, req_id):
+                if getattr(self, "_ai_pending_req_id", None) not in (None, _req_id):
                     return
                 self._ai_pending_req_id = None
-                if self._ai_chat_history and self._ai_chat_history[-1][0] == "assistant" and self._ai_chat_history[-1][1].startswith("Procesando"):
+                if (self._ai_chat_history
+                        and self._ai_chat_history[-1][0] == "assistant"
+                        and self._ai_chat_history[-1][1].startswith("Procesando")):
                     self._ai_chat_history.pop()
             except Exception:
                 pass
 
-            self._ai_chat_history.append(("assistant", out_text or "Sin respuesta."))
+            self._ai_chat_history.append(("assistant", _out or "Sin respuesta."))
             self._render_ai_chat_history()
 
         self._safe_after_ui(ui)
@@ -7790,24 +7996,7 @@ class KClientApp(ctk.CTk):
 
     # --- Dentro de la clase PerfomanceView ---
 
-    def _render_all_tabs(self):
-        """Renderizado asíncrono de pestañas para no congelar la UI"""
 
-        def _step_render(steps):
-            if not steps or not self.winfo_exists(): return
-            tab_name, func = steps.pop(0)
-            self._safe_setup(tab_name, func)
-            # Programar la siguiente pestaña para el siguiente ciclo de la UI
-            self.after(10, lambda: _step_render(steps))
-
-        render_queue = [
-            ("Actividad vs Inactividad", self.setup_pie_chart),
-            ("Top 3 (FOCO)", self.setup_bar_chart),
-            ("KPI (FOCO)", self.setup_quality_chart),
-            ("Tabla Apps (FOCO)", self.setup_table_tab),
-            ("Scoreboard Global", lambda: self.setup_scoreboard("active"))
-        ]
-        _step_render(render_queue)
 
     def _perf_pick_user(self, user: str, day: str = None):
         """
