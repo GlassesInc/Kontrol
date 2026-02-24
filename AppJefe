@@ -13,6 +13,7 @@ import shutil
 import random
 import re
 import sys
+import queue
 from datetime import datetime, timedelta, date
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -30,8 +31,11 @@ import matplotlib.animation as animation
 from tasks_module import TasksModule, DEFAULT_THEME
 
 
-DEFAULT_HOST = "185.254.207.202"
-DEFAULT_PORT = 5555
+DEFAULT_HOST = os.getenv("KONTROL_SERVER_HOST", "185.254.207.202")
+try:
+    DEFAULT_PORT = int(os.getenv("KONTROL_SERVER_PORT", "5555"))
+except ValueError:
+    DEFAULT_PORT = 5555
 # ----------------------------
 # Theme / Colors
 # ----------------------------
@@ -565,6 +569,18 @@ class ScreenshotGallery(ctk.CTkFrame):
         except tk.TclError:
             return
 
+    def _set_pil_img_safe(self, lbl, pil_img, gen: int):
+        try:
+            if getattr(self, "_gen", None) != gen:
+                return
+            if not lbl or not lbl.winfo_exists():
+                return
+            img_tk = ImageTk.PhotoImage(pil_img)
+            lbl.configure(image=img_tk, text="")
+            lbl.image = img_tk
+        except Exception:
+            return
+
     def _set_text_safe(self, lbl, text: str, gen: int):
         try:
             if getattr(self, "_gen", None) != gen:
@@ -574,6 +590,16 @@ class ScreenshotGallery(ctk.CTkFrame):
             lbl.configure(text=text)
         except Exception:
             return
+
+    def _post_ui(self, fn):
+        try:
+            top = self.winfo_toplevel()
+            if hasattr(top, "_enqueue_ui"):
+                top._enqueue_ui(fn)
+                return True
+        except Exception:
+            pass
+        return False
 
     # ----------------------------
     # Lifecycle
@@ -620,10 +646,10 @@ class ScreenshotGallery(ctk.CTkFrame):
                 self.load_local_filenames(local_gen)
 
                 # Si el server tarda, igual no queda “en blanco”
-                self.after(0, lambda g=local_gen: self._set_status("Esperando SCREENSHOT_LIST…", g))
+                self._post_ui(lambda g=local_gen: self._set_status("Esperando SCREENSHOT_LIST…", g))
             except Exception as e:
                 print("sync error:", e)
-                self.after(0, lambda g=local_gen: self._set_status(f"Error sync: {e}", g))
+                self._post_ui(lambda g=local_gen: self._set_status(f"Error sync: {e}", g))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -640,12 +666,12 @@ class ScreenshotGallery(ctk.CTkFrame):
             self.all_filenames = list(merged)
 
             # status
-            self.after(0, lambda g=gen: self._set_status(
+            self._post_ui(lambda g=gen: self._set_status(
                 f"Local: {len(files)} • Server: {len(self.server_filenames)} • Total: {len(self.all_filenames)}",
                 g
             ))
 
-            self.after(0, self.apply_filter)
+            self._post_ui(self.apply_filter)
         except Exception as e:
             print("load_local_filenames:", e)
 
@@ -665,11 +691,11 @@ class ScreenshotGallery(ctk.CTkFrame):
         merged.update(self.server_filenames)
         self.all_filenames = list(merged)
 
-        self.after(0, lambda g=gen: self._set_status(
+        self._post_ui(lambda g=gen: self._set_status(
             f"Lista recibida • Local: {len(local_set)} • Server: {len(self.server_filenames)} • Total: {len(self.all_filenames)}",
             g
         ))
-        self.after(0, self.apply_filter)
+        self._post_ui(self.apply_filter)
 
         # Pedir faltantes (SYNC_CHECK) para que el server empuje PHOTO_DATA
         try:
@@ -827,13 +853,13 @@ class ScreenshotGallery(ctk.CTkFrame):
                         with self.socket_lock:
                             self.sock.sendall(f"DOWNLOAD_PHOTO|{filename}\n".encode("utf-8"))
                     except Exception as e:
-                        self.after(0, lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, f"Error pidiendo foto: {e}", g))
+                        self._post_ui(lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, f"Error pidiendo foto: {e}", g))
                         return
 
                 # 2) esperar a que aparezca y se estabilice
                 if not self.wait_file_stable(local_path, checks=6, delay=0.25):
                     # no llegó: mostrar estado (sin crash)
-                    self.after(0, lambda lw=lbl_widget, g=gen: self._set_text_safe(
+                    self._post_ui(lambda lw=lbl_widget, g=gen: self._set_text_safe(
                         lw, "Pendiente de descarga… (si no baja, revisá PHOTO_DATA en listen_loop)", g
                     ))
                     return
@@ -843,15 +869,15 @@ class ScreenshotGallery(ctk.CTkFrame):
                 img = Image.open(local_path)
                 img.load()
             except Exception:
-                self.after(0, lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, "Archivo de imagen inválido", g))
+                self._post_ui(lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, "Archivo de imagen inválido", g))
                 return
 
             img.thumbnail((820, 420))
-            img_tk = ImageTk.PhotoImage(img)
-            self.after(0, lambda lw=lbl_widget, im=img_tk, g=gen: self._set_img_safe(lw, im, g))
+            img = img.copy()
+            self._post_ui(lambda lw=lbl_widget, im=img, g=gen: self._set_pil_img_safe(lw, im, g))
 
         except Exception as e:
-            self.after(0, lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, f"Error: {e}", g))
+            self._post_ui(lambda lw=lbl_widget, g=gen: self._set_text_safe(lw, f"Error: {e}", g))
 
     @staticmethod
     def wait_file_stable(p, checks=6, delay=0.25):
@@ -1275,7 +1301,7 @@ class PerfomanceView(ctk.CTkFrame):
         self.all_users_stats = all_users_stats or []
         self.on_refresh = on_refresh
         self.on_change_user = on_change_user
-        self.selected_day = date.today().strftime("%Y-%m-%d")
+        self.selected_day = date.today()
 
         self.user_list = user_list or []
         self.selected_apps_to_compare = {}
@@ -1326,8 +1352,10 @@ class PerfomanceView(ctk.CTkFrame):
         self.adv_data = {}   # key -> {"x":[], "y":[]}
 
         self.adv_hours_entry = None
-        self.adv_date_entry = None
         self.adv_btn_start = None
+        self.adv_day_lbl = None
+        self.adv_kpi_mode = "general"  # general | tasks | salary
+        self.adv_kpi_mode_lbl = None
 
         self._adv_tick_job = None
 
@@ -1457,6 +1485,25 @@ class PerfomanceView(ctk.CTkFrame):
         except:
             pass
 
+    def _schedule_render_tabs(self, delay_ms: int = 80):
+        """Debounce de render para evitar congelamientos cuando llegan muchos mensajes seguidos."""
+        try:
+            prev = getattr(self, "_render_after_id", None)
+            if prev:
+                self.after_cancel(prev)
+        except Exception:
+            pass
+
+        def _run():
+            self._render_after_id = None
+            self.clear_loading()
+            self._render_all_tabs()
+
+        try:
+            self._render_after_id = self.after(max(0, int(delay_ms)), _run)
+        except Exception:
+            _run()
+
     def update_data(self, active_time_str=None, inactive_time_str=None, history_raw=None, all_users_stats=None,
                     user_list=None):
         # actualiza estado
@@ -1474,15 +1521,8 @@ class PerfomanceView(ctk.CTkFrame):
         if all_users_stats is not None:
             self.all_users_stats = all_users_stats
 
-        # quita loading y re-renderiza
-        def _do():
-            self.clear_loading()
-            self._render_all_tabs()
-
-        try:
-            self.after(0, _do)
-        except:
-            _do()
+        # quita loading y re-renderiza (debounced para evitar picos)
+        self._schedule_render_tabs(80)
 
     def _parse_duration_to_seconds(self, s: str) -> int:
         import re
@@ -1645,6 +1685,12 @@ class PerfomanceView(ctk.CTkFrame):
                 except Exception:
                     pass
 
+            if hasattr(self, "adv_day_lbl") and self.adv_day_lbl is not None:
+                try:
+                    self.adv_day_lbl.configure(text=f"Fecha seleccionada: {iso}")
+                except Exception:
+                    pass
+
             if notify_server:
                 # ✅ FIX: mostrar loading mientras llegan datos del nuevo día
                 try:
@@ -1659,12 +1705,9 @@ class PerfomanceView(ctk.CTkFrame):
                     except Exception:
                         pass
 
-                # Scoreboard global del día
-                if callable(getattr(self, "on_load_all", None)):
-                    try:
-                        self.on_load_all(iso)
-                    except Exception:
-                        pass
+                # NOTA: no disparamos barrido global automático al cambiar día.
+                # Esto evitó duplicados/solapes de REQUEST_USER_STATS y respuestas pisadas.
+                # El scoreboard puede refrescarse bajo demanda desde su propia UI.
 
         except Exception:
             pass
@@ -1691,7 +1734,18 @@ class PerfomanceView(ctk.CTkFrame):
             return
         self._set_selected_day(d)
 
+    def _dispose_figures(self):
+        for name in ("pie_fig", "bar_fig", "kpi_fig", "custom_fig", "adv_fig"):
+            fig = getattr(self, name, None)
+            if fig is not None:
+                try:
+                    plt.close(fig)
+                except Exception:
+                    pass
+                setattr(self, name, None)
+
     def _render_all_tabs(self):
+        self._dispose_figures()
         self._safe_setup("Actividad vs Inactividad", self.setup_pie_chart)
         self._safe_setup("Top 3 (FOCO)", self.setup_bar_chart)
         self._safe_setup("Comparador", self.setup_custom_chart)
@@ -1701,6 +1755,31 @@ class PerfomanceView(ctk.CTkFrame):
         self._safe_setup("Scoreboard Global", lambda: self.setup_scoreboard("active"))
         self._safe_setup("Herramientas IA", self.setup_ai_tools_tab)
         self._safe_setup("Estadistica avanzada", self.setup_advanced_stats_tab)
+
+
+    def _selected_day_iso(self) -> str:
+        try:
+            d = getattr(self, "selected_day", None)
+            if hasattr(d, "isoformat"):
+                return d.isoformat()
+        except Exception:
+            pass
+        try:
+            return date.today().isoformat()
+        except Exception:
+            return ""
+
+    def _safe_after_ui(self, fn):
+        try:
+            if not self.winfo_exists():
+                return False
+            top = self.winfo_toplevel()
+            if hasattr(top, "_enqueue_ui"):
+                top._enqueue_ui(fn)
+                return True
+            return False
+        except Exception:
+            return False
 
 
     def setup_ai_tools_tab(self):
@@ -1748,13 +1827,14 @@ class PerfomanceView(ctk.CTkFrame):
         right = ctk.CTkFrame(header, fg_color="transparent")
         right.pack(side="right", padx=12, pady=12)
 
-        # Controles (fecha + líneas)
-        self.ai_date_entry = ctk.CTkEntry(right, width=140, placeholder_text="YYYY-MM-DD")
-        self.ai_date_entry.grid(row=0, column=0, padx=(0, 8), pady=(0, 6))
-        try:
-            self.ai_date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
-        except:
-            pass
+        # Controles (usa fecha global seleccionada + líneas)
+        self.ai_day_lbl = ctk.CTkLabel(
+            right,
+            text=f"Fecha: {self._selected_day_iso()}",
+            font=("Roboto", 12),
+            text_color=MUT,
+        )
+        self.ai_day_lbl.grid(row=0, column=0, padx=(0, 8), pady=(0, 6), sticky="e")
 
         self.ai_lines_entry = ctk.CTkEntry(right, width=90, placeholder_text="300")
         self.ai_lines_entry.grid(row=0, column=1, padx=(0, 8), pady=(0, 6))
@@ -1806,7 +1886,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         def _req_log():
             u = (self.user_var.get() or self.target_user or "").strip()
-            day = (self.ai_date_entry.get() or "").strip()
+            day = self._selected_day_iso()
             max_lines = _safe_int(self.ai_lines_entry.get(), 300)
 
             if not u:
@@ -1838,7 +1918,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         def _req_summary():
             u = (self.user_var.get() or self.target_user or "").strip()
-            day = (self.ai_date_entry.get() or "").strip()
+            day = self._selected_day_iso()
             if not u:
                 return
             if not day:
@@ -2028,7 +2108,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         right = ctk.CTkFrame(root, fg_color=PANEL, corner_radius=14, border_width=1, border_color=BORDER)
         right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        right.grid_rowconfigure(6, weight=1)
+        right.grid_rowconfigure(9, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
         # ---- header izquierda
@@ -2068,10 +2148,6 @@ class PerfomanceView(ctk.CTkFrame):
         # Setear límites por defecto
         self._adv_apply_axes_limits()
 
-        # ---- panel derecho
-        ctk.CTkLabel(right, text="Controles", font=("Roboto", 14, "bold"), text_color=TXT).grid(
-            row=0, column=0, sticky="w", padx=12, pady=(12, 6)
-        )
         # ---- panel derecho (header)
         head_r = ctk.CTkFrame(right, fg_color="transparent")
         head_r.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
@@ -2090,13 +2166,14 @@ class PerfomanceView(ctk.CTkFrame):
         )
         self._adv_totals_lbl.grid(row=0, column=1, sticky="e")
 
-        # Fecha
-        self.adv_date_entry = ctk.CTkEntry(right, placeholder_text="YYYY-MM-DD")
-        self.adv_date_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
-        try:
-            self.adv_date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
-        except:
-            pass
+        # Fecha (usa la fecha global seleccionada en la vista)
+        self.adv_day_lbl = ctk.CTkLabel(
+            right,
+            text=f"Fecha seleccionada: {self.selected_day.isoformat()}",
+            font=("Consolas", 12),
+            text_color="#dbe9ff"
+        )
+        self.adv_day_lbl.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
 
         # Horas/día
         self.adv_hours_entry = ctk.CTkEntry(right, placeholder_text="Horas objetivo del día (8)")
@@ -2108,7 +2185,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         # Botones
         btn_row = ctk.CTkFrame(right, fg_color="transparent")
-        btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 10))
+        btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 6))
         btn_row.grid_columnconfigure(0, weight=1)
         btn_row.grid_columnconfigure(1, weight=1)
 
@@ -2122,7 +2199,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         self.adv_btn_start = ctk.CTkButton(
             btn_row,
-            text="EMPEZAR",
+            text="CALCULAR",
             fg_color=ACC,
             text_color="#001013",
             hover_color="#14bdb1",
@@ -2135,16 +2212,34 @@ class PerfomanceView(ctk.CTkFrame):
             fg_color="#7f1d1d",
             hover_color="#991b1b",
             command=self._adv_reset_all
-        ).grid(row=6, column=0, sticky="ew", padx=12, pady=(14, 6))
+        ).grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 6))
+
+        mode_row = ctk.CTkFrame(right, fg_color="transparent")
+        mode_row.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 6))
+        mode_row.grid_columnconfigure((0, 1, 2), weight=1)
+        ctk.CTkButton(mode_row, text="KPI (general)", command=lambda: self._adv_set_kpi_mode("general")).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(mode_row, text="Por tareas", command=lambda: self._adv_set_kpi_mode("tasks")).grid(row=0, column=1, sticky="ew", padx=2)
+        ctk.CTkButton(mode_row, text="€ por hora", command=lambda: self._adv_set_kpi_mode("salary")).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        self.adv_kpi_mode_lbl = ctk.CTkLabel(right, text="Modo KPI IA: general", font=("Roboto", 11), text_color="#a9bfd8")
+        self.adv_kpi_mode_lbl.grid(row=6, column=0, sticky="w", padx=12, pady=(0, 6))
+
+        ctk.CTkButton(
+            right,
+            text="Exportar análisis",
+            fg_color="#8e44ad",
+            hover_color="#6d2f8a",
+            command=self._adv_export_analysis
+        ).grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 8))
 
         # Listado usuarios
         ctk.CTkLabel(right, text="Usuarios añadidos", font=("Roboto", 12, "bold"), text_color=TXT).grid(
-            row=4, column=0, sticky="w", padx=12, pady=(8, 4)
+            row=8, column=0, sticky="w", padx=12, pady=(6, 4)
         )
 
         self._adv_users_box = ctk.CTkTextbox(right, height=160, fg_color="#0b111a", text_color="#dbe9ff",
                                              font=("Consolas", 11), corner_radius=12)
-        self._adv_users_box.grid(row=5, column=0, sticky="nsew", padx=12, pady=(0, 10))
+        self._adv_users_box.grid(row=9, column=0, sticky="nsew", padx=12, pady=(0, 10))
         self._adv_refresh_users_box()
 
         # Nota mensual
@@ -2153,7 +2248,7 @@ class PerfomanceView(ctk.CTkFrame):
             text=f"Mes: {self.adv_days_per_month} días · Efectivo = Real / max(KPI, 20%)",
             font=("Roboto", 11),
             text_color=MUT
-        ).grid(row=7, column=0, sticky="w", padx=12, pady=(0, 12))
+        ).grid(row=10, column=0, sticky="w", padx=12, pady=(0, 12))
 
         # si venía corriendo y re-renderizaste el tab, asegurate de redibujar líneas
         self._adv_redraw_all_lines()
@@ -2167,15 +2262,383 @@ class PerfomanceView(ctk.CTkFrame):
 
     def _adv_get_selected_day(self) -> str:
         try:
-            day = (self.adv_date_entry.get() or "").strip()
-            if day:
-                return day
-        except:
+            if isinstance(self.selected_day, date):
+                return self.selected_day.isoformat()
+        except Exception:
             pass
+        return date.today().isoformat()
+
+    def _adv_set_kpi_mode(self, mode: str):
+        mode = (mode or "general").strip().lower()
+        if mode not in ("general", "tasks", "salary"):
+            mode = "general"
+        self.adv_kpi_mode = mode
         try:
-            return datetime.now().strftime("%Y-%m-%d")
-        except:
-            return ""
+            if self.adv_kpi_mode_lbl:
+                txt = {"general": "Modo KPI IA: general", "tasks": "Modo KPI IA: por tareas", "salary": "Modo KPI IA: € por hora estricto"}.get(mode, "Modo KPI IA: general")
+                self.adv_kpi_mode_lbl.configure(text=txt)
+        except Exception:
+            pass
+        self._adv_refresh_users_box()
+        self._adv_redraw_all_lines()
+
+    def _adv_get_user_entry(self, username: str) -> dict:
+        for u in (self.adv_users or []):
+            if (u.get("name") or "").strip() == (username or "").strip():
+                return u
+        return {}
+
+    def _adv_role_alignment_score(self, role_text: str, raw: str) -> int:
+        role = (role_text or "").lower()
+        txt = (raw or "").lower()
+        if not role or not txt:
+            return 70
+        tokens = [t for t in re.split(r"[^a-zA-Záéíóúñ0-9]+", role) if len(t) >= 4]
+        if not tokens:
+            return 70
+        hits = sum(1 for t in tokens if t in txt)
+        ratio = hits / max(1, len(tokens))
+        return int(max(50, min(95, 55 + ratio * 40)))
+
+
+    def _adv_expected_rubric_seconds(self) -> dict:
+        # Base de 3 expedientes / día (8h = 28.800s)
+        return {
+            "atencion_cliente": 3600,
+            "presupuesto": 3600,
+            "cobro": 600,
+            "operativa": 12000,
+            "tarjeta_embarque": 1800,
+            "administracion": 7200,
+            "total": 28800,
+            "expedientes_dia": 3,
+        }
+
+    def _adv_role_productive_catalog(self, role_text: str) -> dict:
+        role = (role_text or "").strip().lower()
+
+        base = [
+            "kommo", "csdviajes", "csd viajes", "outlook", "gmail", "google workspace",
+            "drive", "sheets", "excel", "docs", "pdf", "acrobat", "whatsapp business",
+        ]
+        operativa = [
+            "amadeus", "sabre", "travelport", "renfe", "iberia", "ryanair", "vueling",
+            "air europa", "avianca", "latam", "aena", "checkmytrip", "activex", "hotelbeds",
+            "booking", "expedia", "skyscanner", "kayak", "kiwi",
+        ]
+        ventas = [
+            "amadeus", "kommo", "salesforce", "hubspot", "pipedrive", "centralita", "3cx",
+            "asterisk", "aircall", "dialpad", "zoom phone", "meet", "teams", "slack",
+        ]
+        direccion = [
+            "power bi", "tableau", "notion", "trello", "asana", "monday", "analytics",
+            "dashboard", "erp", "crm", "finanzas", "informes", "kpi",
+        ]
+        administracion = [
+            "bank", "banco", "santander", "bbva", "caixabank", "ing", "sabadell", "stripe",
+            "paypal", "factura", "facturacion", "contabilidad", "sage", "holded", "a3", "nomina",
+            "calculadora", "calculator", "hacienda", "aeat", "impuestos",
+        ]
+
+        if "oper" in role:
+            return {"role": "Operativa", "apps": sorted(set(base + operativa))}
+        if "vent" in role:
+            return {"role": "Ventas", "apps": sorted(set(base + ventas))}
+        if "direc" in role:
+            return {"role": "Dirección", "apps": sorted(set(base + direccion + operativa + ventas + administracion))}
+        if "admin" in role:
+            return {"role": "Administración", "apps": sorted(set(base + administracion))}
+        return {"role": role_text or "General", "apps": sorted(set(base))}
+
+    def _adv_extract_app_seconds(self, raw: str) -> dict:
+        out = {}
+        if not isinstance(raw, str) or not raw.strip():
+            return out
+        for ln in raw.splitlines():
+            line = (ln or "").strip()
+            if not line.startswith(">"):
+                continue
+            m = re.search(r"\[([^\]]+)\]", line)
+            if not m:
+                continue
+            try:
+                sec = int(self.parse_time_to_seconds(m.group(1).strip()) or 0)
+            except Exception:
+                sec = 0
+            if sec <= 0:
+                continue
+            app_name = line.split("[", 1)[0].replace(">", "").strip()
+            out[app_name] = out.get(app_name, 0) + sec
+        return out
+
+
+    def set_user_tasks(self, user: str, tasks: list):
+        try:
+            if not hasattr(self, "_adv_tasks_by_user"):
+                self._adv_tasks_by_user = {}
+            self._adv_tasks_by_user[(user or "").strip()] = tasks[:] if isinstance(tasks, list) else []
+        except Exception:
+            pass
+
+    def _adv_tasks_text_for_prompt(self, username: str) -> str:
+        try:
+            if not hasattr(self, "_adv_tasks_by_user"):
+                self._adv_tasks_by_user = {}
+            arr = self._adv_tasks_by_user.get((username or "").strip(), []) or []
+            if not arr:
+                return "No hay tareas en las que basarse para este usuario/día."
+
+            lines = []
+            for t in arr[:20]:
+                if not isinstance(t, dict):
+                    continue
+                title = (t.get("title") or t.get("name") or "(sin título)").strip()
+                status = (t.get("status") or "").strip()
+                done = bool(t.get("done", False))
+                sec = int(t.get("time_total_sec") or 0)
+                due = (t.get("due_at") or "").strip()
+                source = (t.get("source") or "manual").strip()
+                lines.append(f"- {title} | status={status or ('DONE' if done else 'PENDING')} | tiempo={self.format_seconds(sec)} | due={due or '—'} | origen={source}")
+            return "\n".join(lines) if lines else "No hay tareas en las que basarse para este usuario/día."
+        except Exception:
+            return "No hay tareas en las que basarse para este usuario/día."
+
+    def _adv_tasks_mode_ratio(self, role_text: str, raw: str) -> float:
+        app_secs = self._adv_extract_app_seconds(raw)
+        if not app_secs:
+            return 0.55
+
+        catalog = self._adv_role_productive_catalog(role_text)
+        allowed = [x.lower() for x in catalog.get("apps", [])]
+        productive_sec = 0
+        ocio_sec = 0
+        neutral_sec = 0
+
+        for app, sec in app_secs.items():
+            low = (app or "").lower()
+            if any(k in low for k in DISTRACTION_KEYWORDS):
+                ocio_sec += sec
+            elif any(k in low for k in allowed):
+                productive_sec += sec
+            else:
+                neutral_sec += sec
+
+        observed = productive_sec + ocio_sec + neutral_sec
+        rubric = self._adv_expected_rubric_seconds()
+        expected_total = float(rubric.get("total", 28800))
+
+        productive_ratio = productive_sec / max(1.0, observed)
+        ocio_penalty = ocio_sec / max(1.0, observed)
+        workload_ratio = min(1.15, observed / max(1.0, expected_total))
+
+        score = (productive_ratio * 0.70) + (workload_ratio * 0.25) - (ocio_penalty * 0.35)
+        return max(0.20, min(0.98, score))
+
+    def _adv_export_analysis(self):
+        try:
+            from fpdf import FPDF
+
+            export_dir = os.path.join(get_appdata_base_dir(), "exports_analisis")
+            os.makedirs(export_dir, exist_ok=True)
+
+            day = self._adv_get_selected_day()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_name = f"adv_{day}_{ts}"
+            base = os.path.join(export_dir, base_name)
+
+            img_path = base + ".png"
+            if self.adv_fig is not None:
+                self.adv_fig.savefig(img_path, dpi=140, bbox_inches="tight")
+
+            def clean_pdf_text(x: str) -> str:
+                t = str(x or "")
+                t = t.replace("€", "EUR")
+                return t.encode("latin-1", "ignore").decode("latin-1")
+
+            def low_perf_from_raw(raw: str, top_n: int = 8):
+                out = []
+                if not isinstance(raw, str) or not raw.strip():
+                    return out
+                for ln in raw.splitlines():
+                    ln = ln.strip()
+                    if not ln.startswith(">"):
+                        continue
+                    m = re.search(r"\[([^\]]+)\]", ln)
+                    if not m:
+                        continue
+                    dur = m.group(1).strip()
+                    try:
+                        sec = int(self.parse_time_to_seconds(dur) or 0)
+                    except Exception:
+                        sec = 0
+                    if sec <= 0:
+                        continue
+                    name = ln.split("[", 1)[0].replace(">", "").strip()
+                    low = name.lower()
+                    if any(k in low for k in DISTRACTION_KEYWORDS):
+                        out.append((name, sec))
+                out.sort(key=lambda x: x[1], reverse=True)
+                return out[:top_n]
+
+            # contexto por usuario
+            lines = [f"Fecha seleccionada: {day}", f"Modo KPI IA: {self.adv_kpi_mode}", "", "Usuarios:"]
+            low_perf_global = []
+            for u in (self.adv_users or []):
+                real_s, eff_s, kpi_pct = self._adv_user_cost_per_sec(u)
+                name = (u.get('name') or '').strip()
+                role = u.get('role')
+                eur_h = u.get('eur_per_hour')
+                lines.append(f"- {name} | rol={role} | EUR/h={eur_h} | KPI={kpi_pct}% | real={real_s:.4f} | eff={eff_s:.4f}")
+
+                raw = self._adv_get_user_raw_for_ai(name)
+                tasks_txt = self._adv_tasks_text_for_prompt(name)
+                lines.append(f"  Tareas sincronizadas ({name}):")
+                lines.extend([f"    {ln}" for ln in (tasks_txt.splitlines() or ["No hay tareas en las que basarse."])][:25])
+
+                low_perf = low_perf_from_raw(raw, top_n=5)
+                if low_perf:
+                    lines.append(f"  Actividades que bajan rendimiento ({name}):")
+                    for app, sec in low_perf:
+                        low_perf_global.append((name, app, sec))
+                        lines.append(f"    - {app} [{self.format_seconds(sec)}]")
+
+            # contexto capturas + log IA (análisis de capturas)
+            ai_log_txt = (self._ai_log_text or '').strip()
+            if ai_log_txt:
+                lines.append("")
+                lines.append("Extracto análisis IA de capturas:")
+                lines.extend((ai_log_txt[:7000]).splitlines()[:40])
+
+            shots = []
+            try:
+                day_compact = day.replace("-", "")
+                for fn in sorted(os.listdir(get_cache_dir())):
+                    if day_compact in fn:
+                        shots.append(fn)
+            except Exception:
+                pass
+
+            if shots:
+                lines.append("")
+                lines.append(f"Capturas detectadas del día ({len(shots)}):")
+                for fn in shots[:20]:
+                    lines.append(f"- {fn}")
+
+            # resumen IA (con fallback) y mención explícita de actividades que bajan rendimiento
+            summary = (
+                "Resumen: rendimiento dentro de lo esperable. "
+                "Revisar actividades de distracción detectadas y contrastarlas con el rol/tareas."
+            )
+            try:
+                if os.getenv("OPENAI_API_KEY"):
+                    from openai import OpenAI
+                    client = OpenAI(timeout=25)
+                    rubric = self._adv_expected_rubric_seconds()
+                    prompt = (
+                        "Genera un resumen ejecutivo del rendimiento diario por persona y global. "
+                        "Mide el tiempo invertido por web/app y compáralo con objetivo de 3 expedientes/día. "
+                        f"Rubrica objetivo total: {rubric.get('total', 28800)}s/día (8h). "
+                        f"Desglose: atención {rubric.get('atencion_cliente')}s, presupuesto {rubric.get('presupuesto')}s, cobro {rubric.get('cobro')}s, operativa {rubric.get('operativa')}s, tarjeta {rubric.get('tarjeta_embarque')}s, administración {rubric.get('administracion')}s. "
+                        "Clasifica por rol y considera productivas (ejemplos): "
+                        "Operativa -> kommo, amadeus/sabre/travelport, webs aerolíneas, activex, csdviajes; "
+                        "Ventas -> kommo, amadeus, centralita/telefonía (3cx/aircall/dialpad); "
+                        "Dirección -> casi todas salvo ocio explícito; "
+                        "Administración -> bancos, facturación/contabilidad, calculadora, kommo. "
+                        "Incluye: (1) desvío de tiempo esperado por rol, (2) apps concretas que bajan rendimiento, "
+                        "(3) señales de capturas/IA, (4) recomendaciones accionables.\n\n"
+                        + "\n".join(lines)
+                    )
+                    resp = client.responses.create(
+                        model="gpt-4o-mini",
+                        input=[{"role": "user", "content": prompt}]
+                    )
+                    out = ""
+                    for item in getattr(resp, "output", []) or []:
+                        if getattr(item, "type", None) == "message":
+                            for c in getattr(item, "content", []) or []:
+                                if getattr(c, "type", None) in ("output_text", "text"):
+                                    out += getattr(c, "text", "")
+                    if (out or "").strip():
+                        summary = out.strip()
+            except Exception:
+                pass
+
+            # TXT export
+            txt_path = base + ".txt"
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+                f.write("\n\n" + summary + "\n")
+
+            # PDF export (incluye gráfica)
+            pdf_path = base + ".pdf"
+            pdf = FPDF(orientation="P", unit="mm", format="A4")
+            pdf.set_margins(12, 12, 12)
+            pdf.set_auto_page_break(auto=True, margin=12)
+            pdf.add_page()
+
+            epw = pdf.w - pdf.l_margin - pdf.r_margin
+            pdf.set_font("Arial", "B", 15)
+            pdf.cell(epw, 8, clean_pdf_text("Analisis estadistica avanzada"), ln=True)
+            pdf.set_font("Arial", "", 11)
+            pdf.cell(epw, 7, clean_pdf_text(f"Fecha seleccionada: {day}"), ln=True)
+            pdf.cell(epw, 7, clean_pdf_text(f"Modo KPI IA: {self.adv_kpi_mode}"), ln=True)
+            pdf.ln(2)
+
+            if os.path.exists(img_path):
+                try:
+                    pdf.image(img_path, x=pdf.l_margin, y=pdf.get_y(), w=epw)
+                    pdf.ln(95)
+                except Exception:
+                    pass
+
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(epw, 7, clean_pdf_text("Resumen IA"), ln=True)
+            pdf.set_font("Arial", "", 10)
+            pdf.multi_cell(epw, 5, clean_pdf_text(summary))
+            pdf.ln(2)
+
+            pdf.set_font("Arial", "B", 11)
+            pdf.cell(epw, 7, clean_pdf_text("Actividades que bajan rendimiento"), ln=True)
+            pdf.set_font("Arial", "", 9)
+            if low_perf_global:
+                for uname, app, sec in low_perf_global[:30]:
+                    pdf.multi_cell(epw, 5, clean_pdf_text(f"- {uname}: {app} [{self.format_seconds(sec)}]"))
+            else:
+                pdf.multi_cell(epw, 5, clean_pdf_text("No se detectaron actividades de baja productividad con tiempo significativo."))
+
+            if shots:
+                pdf.ln(2)
+                pdf.set_font("Arial", "B", 11)
+                pdf.cell(epw, 7, clean_pdf_text("Capturas consideradas"), ln=True)
+                pdf.set_font("Arial", "", 9)
+                for fn in shots[:20]:
+                    pdf.multi_cell(epw, 5, clean_pdf_text(f"- {fn}"))
+
+            if ai_log_txt:
+                pdf.ln(2)
+                pdf.set_font("Arial", "B", 11)
+                pdf.cell(epw, 7, clean_pdf_text("Extracto analisis IA de capturas"), ln=True)
+                pdf.set_font("Courier", "", 8)
+                snippet = clean_pdf_text(ai_log_txt[:5000])
+                pdf.multi_cell(epw, 4, snippet)
+
+            pdf.output(pdf_path)
+
+            # guardar también en Descargas
+            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            if os.path.isdir(downloads_dir):
+                try:
+                    shutil.copy2(pdf_path, os.path.join(downloads_dir, os.path.basename(pdf_path)))
+                except Exception:
+                    pass
+
+            messagebox.showinfo(
+                "Exportación",
+                f"Análisis exportado:\n{img_path}\n{txt_path}\n{pdf_path}"
+            )
+        except Exception as e:
+            messagebox.showerror("Exportación", f"No se pudo exportar análisis: {e}")
+
 
     def _adv_reset_all(self):
         from tkinter import messagebox
@@ -2334,7 +2797,7 @@ class PerfomanceView(ctk.CTkFrame):
         score = None
         try:
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(timeout=35)
 
             system_prompt = (
                 "Sos un analista de productividad para una agencia de viajes.\n"
@@ -2344,16 +2807,40 @@ class PerfomanceView(ctk.CTkFrame):
                 "Respondé SOLO un número entero (sin texto extra).\n"
             )
 
+            user_obj = self._adv_get_user_entry(username)
+            role_txt = (user_obj.get("role") or "") if isinstance(user_obj, dict) else ""
+            eur_h = float((user_obj.get("eur_per_hour") or 0.0) if isinstance(user_obj, dict) else 0.0)
+            mode = (self.adv_kpi_mode or "general").lower()
+
+            rubric = self._adv_expected_rubric_seconds()
+            role_meta = self._adv_role_productive_catalog(role_txt)
+            app_map = self._adv_extract_app_seconds(raw)
+            top_apps = sorted(app_map.items(), key=lambda x: x[1], reverse=True)[:18]
+            top_apps_txt = "\n".join([f"- {a}: {self.format_seconds(sec)}" for a, sec in top_apps])
+
+            tasks_txt = self._adv_tasks_text_for_prompt(username)
+
             user_prompt = (
                 f"Usuario: {username}\n"
-                f"Fecha: {day}\n\n"
-                "Historial RAW:\n"
+                f"Fecha: {day}\n"
+                f"Modo KPI: {mode}\n"
+                f"Rol/Tareas esperadas: {role_txt}\n"
+                f"Pago por hora: {eur_h:.2f} €/h\n"
+                f"Rubrica diaria objetivo: {rubric.get('expedientes_dia', 3)} expedientes, total {rubric.get('total', 28800)}s (8h).\n"
+                f"Desglose objetivo (s): atencion={rubric.get('atencion_cliente')}, presupuesto={rubric.get('presupuesto')}, cobro={rubric.get('cobro')}, operativa={rubric.get('operativa')}, tarjeta={rubric.get('tarjeta_embarque')}, admin={rubric.get('administracion')}\n"
+                f"Apps productivas esperadas por rol {role_meta.get('role')}: {', '.join(role_meta.get('apps', [])[:80])}\n\n"
+                "Top apps por tiempo del historial:\n"
+                f"{top_apps_txt or '- Sin datos'}\n\n"
+                "Historial RAW completo:\n"
                 f"{raw}\n\n"
-                "Criterio:\n"
-                "- 100 = foco y tareas claramente productivas casi todo el tiempo.\n"
+                "Criterio de puntuación:\n"
+                "- No des 100, nadie es perfecto. Máximo 98.\n"
+                "- En modo tasks, medir productividad por TIEMPO en apps/webs alineadas al rol y por cumplimiento de carga esperada de 3 expedientes/día.\n"
+                "- Penalizar tiempo en ocio y desvíos de rol.\n"
+                "- En modo salary, ser más estricto cuanto mayor sea €/h.\n"
                 "- 50 = mezcla fuerte de productivo y ocio/dispersión.\n"
                 "- 20 = muy poco productivo.\n"
-                "Devolvé SOLO el número entero 1..100.\n"
+                "Devolvé SOLO el número entero 1..98.\n"
             )
 
             resp = client.responses.create(
@@ -2382,8 +2869,8 @@ class PerfomanceView(ctk.CTkFrame):
             score = 80
         if score < 1:
             score = 1
-        if score > 100:
-            score = 100
+        if score > 98:
+            score = 98
 
         def ui():
             for u in self.adv_users:
@@ -2396,10 +2883,7 @@ class PerfomanceView(ctk.CTkFrame):
             # redibujo opcional (no obligatorio, pero mantiene todo coherente)
             self._adv_redraw_all_lines()
 
-        try:
-            self.after(0, ui)
-        except:
-            ui()
+        self._safe_after_ui(ui)
 
     def _adv_refresh_users_box(self):
         try:
@@ -2571,58 +3055,71 @@ class PerfomanceView(ctk.CTkFrame):
         self.adv_ax.set_ylim(0, ymax * 1.12)
 
     def _adv_start_stop(self):
-        # toggle
-        if self.adv_running:
-            self.adv_running = False
-            try:
-                if self.adv_btn_start:
-                    self.adv_btn_start.configure(text="EMPEZAR")
-            except:
-                pass
-            # cancelar job
-            try:
-                if self._adv_tick_job:
-                    self.after_cancel(self._adv_tick_job)
-                    self._adv_tick_job = None
-            except:
-                pass
-            return
+        """Calcula el resultado del día completo sin animación incremental."""
+        # cancelar loop viejo si existía
+        self.adv_running = False
+        try:
+            if self._adv_tick_job:
+                self.after_cancel(self._adv_tick_job)
+        except Exception:
+            pass
+        self._adv_tick_job = None
 
-        # iniciar: validar horas
         try:
             h = float((self.adv_hours_entry.get() or "8").strip())
             if h <= 0:
                 h = 8.0
-        except:
+        except Exception:
             h = 8.0
 
         self.adv_total_seconds = int(h * 3600)
-        self.adv_seconds = 0
+        self.adv_seconds = self.adv_total_seconds
 
-        # reset series a 0
-        for k in list(self.adv_data.keys()):
-            self.adv_data[k] = {"x": [0], "y": [0.0]}
-            if k in self.adv_lines:
-                self.adv_lines[k].set_data([0], [0.0])
+        if not self.adv_users:
+            return
+
+        # recalcular series completas (2 puntos: inicio y fin)
+        for u in self.adv_users:
+            name = (u.get("name") or "").strip()
+            if not name:
+                continue
+            eur_h = float(u.get("eur_per_hour") or 0.0)
+            cost_sec_real = eur_h / 3600.0
+
+            kpi_ratio = self._adv_get_user_kpi(name)
+            kpi_pct = int(round(kpi_ratio * 100))
+            if kpi_pct < 20:
+                kpi_pct = 20
+            if kpi_pct > 98:
+                kpi_pct = 98
+            ratio = kpi_pct / 100.0
+            cost_sec_eff = cost_sec_real / max(0.2, ratio)
+
+            kr = f"{name}:real"
+            ke = f"{name}:eff"
+
+            final_real = cost_sec_real * self.adv_total_seconds
+            final_eff = cost_sec_eff * self.adv_total_seconds
+
+            self.adv_data[kr] = {"x": [0, self.adv_total_seconds], "y": [0.0, final_real]}
+            self.adv_data[ke] = {"x": [0, self.adv_total_seconds], "y": [0.0, final_eff]}
+
+            if kr in self.adv_lines:
+                self.adv_lines[kr].set_data(self.adv_data[kr]["x"], self.adv_data[kr]["y"])
+            if ke in self.adv_lines:
+                self.adv_lines[ke].set_data(self.adv_data[ke]["x"], self.adv_data[ke]["y"])
 
         self._adv_apply_axes_limits()
         self._adv_autoscale_y()
+        self._adv_refresh_totals()
         if self.adv_canvas:
             self.adv_canvas.draw_idle()
 
-        if not self.adv_users:
-            # no arrancar sin usuarios
-            return
-
-        self.adv_running = True
         try:
             if self.adv_btn_start:
-                self.adv_btn_start.configure(text="DETENER")
-        except:
+                self.adv_btn_start.configure(text="RECALCULAR")
+        except Exception:
             pass
-
-        # tick loop
-        self._adv_tick()
 
     def _adv_tick(self):
         if not self.adv_running:
@@ -2696,38 +3193,59 @@ class PerfomanceView(ctk.CTkFrame):
         self._adv_refresh_totals()
 
     def _adv_get_user_kpi(self, username: str) -> float:
-        """
-        KPI como ratio 0..1.
-        - Si el usuario es el target_user actual: calcula desde self.history_raw (FOCO).
-        - Si está en all_users_stats y trae 'raw': calcula desde ese raw.
-        - Si no hay datos: fallback 0.80
-        """
-        # 1) si es el usuario actual
+        """KPI 0..1 basado en modo seleccionado. Nunca devuelve 100% exacto."""
+        base_ratio = 0.80
+
+        # KPI foco base desde raw/historial
         try:
             if (username or "").strip() == (self.target_user or "").strip():
                 stats = self.get_categorized_data()
                 total = stats["Productivo"] + stats["Ocio"]
                 if total > 0:
-                    return max(0.0, min(1.0, stats["Productivo"] / total))
-        except:
+                    base_ratio = max(0.0, min(1.0, stats["Productivo"] / total))
+            else:
+                for u in (self.all_users_stats or []):
+                    if not isinstance(u, dict):
+                        continue
+                    name = u.get("name") or u.get("user") or u.get("username")
+                    if (name or "").strip() != (username or "").strip():
+                        continue
+                    raw = u.get("raw")
+                    if isinstance(raw, str) and raw.strip():
+                        kpi_pct = int(self._compute_kpi_from_raw_block(raw) or 80)
+                        base_ratio = max(0.0, min(1.0, kpi_pct / 100.0))
+                    break
+        except Exception:
             pass
 
-        # 2) buscar en all_users_stats raw
-        try:
-            for u in (self.all_users_stats or []):
-                if not isinstance(u, dict):
-                    continue
-                name = u.get("name") or u.get("user") or u.get("username")
-                if (name or "").strip() != (username or "").strip():
-                    continue
-                raw = u.get("raw")
-                if isinstance(raw, str) and raw.strip():
-                    kpi_pct = int(self._compute_kpi_from_raw_block(raw) or 0)
-                    return max(0.0, min(1.0, kpi_pct / 100.0))
-        except:
-            pass
+        u = self._adv_get_user_entry(username)
+        day = self._adv_get_selected_day()
+        ai_eff = u.get("ai_eff") if isinstance(u, dict) else None
+        ai_day = u.get("ai_eff_day") if isinstance(u, dict) else None
+        if ai_eff is None or ai_day != day:
+            self._adv_request_ai_efficiency_async(username)
+            ai_eff = 80
+        ai_ratio = max(0.01, min(0.98, float(ai_eff) / 100.0))
 
-        return 0.80
+        mode = (self.adv_kpi_mode or "general").lower()
+        raw = self._adv_get_user_raw_for_ai(username)
+
+        if mode == "tasks":
+            role_txt = (u.get("role") if isinstance(u, dict) else "")
+            role_score = self._adv_role_alignment_score(role_txt, raw)
+            role_ratio = role_score / 100.0
+            tasks_ratio = self._adv_tasks_mode_ratio(role_txt, raw)
+            out = (base_ratio * 0.30) + (ai_ratio * 0.30) + (role_ratio * 0.15) + (tasks_ratio * 0.25)
+        elif mode == "salary":
+            eur_h = float((u.get("eur_per_hour") if isinstance(u, dict) else 0.0) or 0.0)
+            strict_target = min(0.95, 0.68 + (eur_h / 200.0))
+            penalty = max(0.0, strict_target - base_ratio)
+            out = (base_ratio * 0.55) + (ai_ratio * 0.45) - (penalty * 0.35)
+        else:
+            out = (base_ratio * 0.60) + (ai_ratio * 0.40)
+
+        # nunca 100% perfecto
+        return max(0.20, min(0.98, out))
 
     def _render_ai_chat_history(self):
         if not hasattr(self, "_ai_chat_scroll") or not self._ai_chat_scroll:
@@ -2822,7 +3340,7 @@ class PerfomanceView(ctk.CTkFrame):
         user = (self.user_var.get() or self.target_user or "").strip()
         day = ""
         try:
-            day = (self.ai_date_entry.get() or "").strip()
+            day = self._selected_day_iso()
         except:
             pass
 
@@ -2831,14 +3349,31 @@ class PerfomanceView(ctk.CTkFrame):
         # mensaje "typing" neutro
         self._append_chat("assistant", "Procesando…")
 
+        req_id = int(time.time() * 1000)
+        self._ai_pending_req_id = req_id
+
+        def _watchdog(rid=req_id):
+            try:
+                if getattr(self, "_ai_pending_req_id", None) != rid:
+                    return
+                if self._ai_chat_history and self._ai_chat_history[-1][0] == "assistant" and self._ai_chat_history[-1][1].startswith("Procesando"):
+                    self._ai_chat_history.pop()
+                    self._ai_chat_history.append(("assistant", "La solicitud tardó demasiado. Revisá conexión/API key e intentá nuevamente."))
+                    self._render_ai_chat_history()
+                self._ai_pending_req_id = None
+            except Exception:
+                pass
+
+        self._safe_after_ui(lambda rid=req_id: self.after(45000, lambda: _watchdog(rid)))
+
         import threading
         threading.Thread(
             target=self._ai_chat_worker_pro,
-            args=(q, context),
+            args=(q, context, req_id),
             daemon=True
         ).start()
 
-    def _ai_chat_worker_pro(self, question: str, context: str):
+    def _ai_chat_worker_pro(self, question: str, context: str, req_id: int):
         """
         Igual que tu worker, pero:
         - no devuelve errores crudos
@@ -2847,7 +3382,7 @@ class PerfomanceView(ctk.CTkFrame):
         out_text = ""
         try:
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(timeout=35)
 
             system_prompt = (
                 "Sos un asistente para un jefe que monitorea productividad en una agencia de viajes.\n"
@@ -2890,21 +3425,19 @@ class PerfomanceView(ctk.CTkFrame):
             out_text = "No pude responder en este momento. Probá de nuevo o verificá la configuración de la API."
 
         def ui():
-            # borrar el último "Procesando…" si existe
             try:
-                if self._ai_chat_history and self._ai_chat_history[-1][0] == "assistant" and self._ai_chat_history[-1][
-                    1].startswith("Procesando"):
+                if getattr(self, "_ai_pending_req_id", None) not in (None, req_id):
+                    return
+                self._ai_pending_req_id = None
+                if self._ai_chat_history and self._ai_chat_history[-1][0] == "assistant" and self._ai_chat_history[-1][1].startswith("Procesando"):
                     self._ai_chat_history.pop()
-            except:
+            except Exception:
                 pass
 
             self._ai_chat_history.append(("assistant", out_text or "Sin respuesta."))
             self._render_ai_chat_history()
 
-        try:
-            self.after(0, ui)
-        except:
-            ui()
+        self._safe_after_ui(ui)
 
     def _build_ai_context(self, user: str, day: str) -> str:
         # contexto principal: log IA recibido (si existe)
@@ -2937,7 +3470,7 @@ class PerfomanceView(ctk.CTkFrame):
         """
         try:
             from openai import OpenAI
-            client = OpenAI()
+            client = OpenAI(timeout=35)
 
             system_prompt  = (
                 "Sos un asistente para un jefe que monitorea actividad/productividad.\n"
@@ -3047,10 +3580,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             self._ai_chat_history.append(("assistant", out_text))
             self._render_ai_chat_history()
 
-        try:
-            self.after(0, ui)
-        except:
-            ui()
+        self._safe_after_ui(ui)
 
     def set_ai_log_text(self, user: str, day: str, text: str):
         self._ai_log_meta = f"{user} — {day}"
@@ -3069,10 +3599,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             except:
                 pass
 
-        try:
-            self.after(0, ui)
-        except:
-            ui()
+        self._safe_after_ui(ui)
 
     def _on_pick_user(self, user):
         if not user or user == self.target_user:
@@ -3634,7 +4161,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             widget.destroy()
 
         # figura
-        fig, ax = plt.subplots(figsize=(3, 2), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.2, 2.6), dpi=72)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
 
@@ -3651,20 +4178,14 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
                 colors=['#2ecc71', '#e74c3c'],
                 textprops={'color': "w", 'weight': 'bold'},
                 startangle=90,
-                explode=(0.05, 0)
+                explode=(0.03, 0),
+                radius=0.72
             )
         ax.set_title("PROPORCIÓN DE ACTIVIDAD", color='white', pad=20, fontweight='bold')
 
         canvas = FigureCanvasTkAgg(fig, master=tab)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
-        chart_holder = ctk.CTkFrame(self, width=900, height=320)
-        chart_holder.pack(fill="x", padx=10, pady=10)  # NO expand
-        chart_holder.pack_propagate(False)  # ✅ evita que se achique
-
-        canvas = FigureCanvasTkAgg(fig, master=chart_holder)
-        w = canvas.get_tk_widget()
-        w.pack(fill="both", expand=True)  # expand SOLO dentro del holder fijo
 
         # guardar refs para evitar GC
         self.pie_fig = fig
@@ -3690,7 +4211,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         labels = [a[:32] for a, _ in items]
         hours = [(sec / 3600.0) for _, sec in items]
 
-        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=72)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
         ax.bar(labels, hours, color='#3498db')
@@ -3699,6 +4220,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         for s in ax.spines.values():
             s.set_color('#444')
         ax.set_ylabel("Horas", color="white")
+        ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=15, ha="right", color="white")
 
         canvas = FigureCanvasTkAgg(fig, master=tab)
@@ -3707,13 +4229,6 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
 
         self.bar_fig = fig
         self.bar_canvas = canvas
-        chart_holder = ctk.CTkFrame(self, width=900, height=320)
-        chart_holder.pack(fill="x", padx=10, pady=10)  # NO expand
-        chart_holder.pack_propagate(False)  # ✅ evita que se achique
-
-        canvas = FigureCanvasTkAgg(fig, master=chart_holder)
-        w = canvas.get_tk_widget()
-        w.pack(fill="both", expand=True)  # expand SOLO dentro del holder fijo
 
     # =========================
     # TAB: Comparador
@@ -3749,7 +4264,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         self.lbl_added = ctk.CTkLabel(tab, text="Factores: Ninguno")
         self.lbl_added.pack(pady=(0, 6))
 
-        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=72)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
         ax.text(0.5, 0.5, "Añadí factores arriba", color="white", ha="center", va="center")
@@ -3761,13 +4276,6 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
         self.custom_fig = fig
         self.custom_ax = ax
         self.custom_canvas = canvas
-        chart_holder = ctk.CTkFrame(self, width=900, height=320)
-        chart_holder.pack(fill="x", padx=10, pady=10)  # NO expand
-        chart_holder.pack_propagate(False)  # ✅ evita que se achique
-
-        canvas = FigureCanvasTkAgg(fig, master=chart_holder)
-        w = canvas.get_tk_widget()
-        w.pack(fill="both", expand=True)  # expand SOLO dentro del holder fijo
 
     def add_factor(self):
         app = self.comp_menu.get()
@@ -3844,7 +4352,7 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
             text_color="white"
         ).pack(side="left", padx=12)
 
-        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+        fig, ax = plt.subplots(figsize=(4.6, 2.8), dpi=72)
         fig.patch.set_facecolor('#1a1a1a')
         ax.set_facecolor('#1a1a1a')
 
@@ -3859,7 +4367,8 @@ basandote en que es lo mejor para la empresa de viajes y caules son las funciona
                 colors=['#2ecc71', '#e74c3c'],
                 textprops={'color': "w"},
                 startangle=90,
-                wedgeprops=dict(width=0.4)
+                radius=0.78,
+                wedgeprops=dict(width=0.32)
             )
         ax.set_title("CALIDAD DE TRABAJO (KPI - FOCO)", color="white")
 
@@ -4820,6 +5329,8 @@ class KClientApp(ctk.CTk):
         self.send_lock = threading.Lock()  # ✅ este va acá
         self.sock: Optional[socket.socket] = None
         self.connected = False
+        self._ui_queue = queue.Queue()
+        self._ui_pump_after_id = None
 
         # =========================
         # Auto-reconexión (cliente jefe)
@@ -4840,7 +5351,8 @@ class KClientApp(ctk.CTk):
         # =========================
         self._auto_stats_thread = None
         self._auto_stats_stop = threading.Event()
-        self._stats_req_last: Dict[str, float] = {}  # user -> last request time
+        self._stats_req_last: Dict[str, float] = {}  # user|day -> last request time
+        self._stats_request_day_cache = date.today().isoformat()
         # =========================
         # Auto-capturas por hora (random dentro de la hora)
         # =========================
@@ -4875,10 +5387,17 @@ class KClientApp(ctk.CTk):
         self._stats_block_fg_time = None
         self._stats_block_bg_time = None
         self._stats_block_lines = []
+        self._stats_block_date = ""
+        self._stats_flush_after_id = None
 
+        # generación para cancelar barridos viejos de stats all-users
+        self._all_stats_req_gen = 0
 
         # ✅ Si el servidor envía las líneas de stats ANTES del header USER_STATS (orden invertido), las guardamos aquí
         self._pre_stats_lines = []
+
+        # tasks sync cache (server)
+        self._tasks_by_user = {}
         # =========================
         # Ventanas
         # =========================
@@ -4890,7 +5409,56 @@ class KClientApp(ctk.CTk):
         # UI Login + autologin
         # =========================
         self._build_login()
+        self._ui_pump_after_id = self.after(25, self._pump_ui_queue)
         self.after(350, self._try_autologin)
+
+    def _enqueue_ui(self, fn):
+        try:
+            if getattr(self, "_closing", False):
+                return False
+            self._ui_queue.put_nowait(fn)
+            return True
+        except Exception:
+            return False
+
+    def _pump_ui_queue(self):
+        self._ui_pump_after_id = None
+        try:
+            if getattr(self, "_closing", False) or not self.winfo_exists():
+                return
+        except Exception:
+            return
+
+        try:
+            for _ in range(80):
+                try:
+                    fn = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn()
+                except Exception as e:
+                    print("ui_queue fn error:", e)
+        except Exception:
+            pass
+
+        try:
+            self._ui_pump_after_id = self.after(25, self._pump_ui_queue)
+        except Exception:
+            self._ui_pump_after_id = None
+
+    def _run_on_ui(self, fn, delay_ms: int = 0) -> bool:
+        try:
+            if delay_ms and int(delay_ms) > 0:
+                ms = int(delay_ms)
+                def delayed():
+                    time.sleep(ms / 1000.0)
+                    self._enqueue_ui(fn)
+                threading.Thread(target=delayed, daemon=True).start()
+                return True
+            return self._enqueue_ui(fn)
+        except Exception:
+            return False
 
     # ----------------------------
     # LOGIN UI
@@ -5202,23 +5770,51 @@ class KClientApp(ctk.CTk):
             "SHOW_POPUP|",
             "TAKE_SCREENSHOT|",
             "SYNC_CHECK|",
+            "AI_LOG_DATA|",
+            "AI_CHAT_RESP|",
+            "HIST_DATES|",
+            "HIST_DATA|",
+            "DISTRACTION_CFG|",
+            "TASKS_SYNC|",
+            "TASK_EVT|",
+            "REWARDS_SYNC|",
+            "REWARD_EVT|",
+            "PONG",
         )
         return line.startswith(prefixes)
 
-    def _request_user_stats_throttled(self, user: str):
+    def _get_selected_day_for_requests(self):
+        """Devuelve día YYYY-MM-DD sin tocar objetos Tk desde hilos secundarios."""
+        try:
+            day = (getattr(self, "_stats_request_day_cache", "") or "").strip()
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+                return day
+        except Exception:
+            pass
+        return date.today().isoformat()
+
+    def _request_user_stats_throttled(self, user: str, day: str = None):
         user = (user or "").strip()
         if not user:
             return
         if not getattr(self, "sock", None) or not getattr(self, "connected", False):
             return
 
+        if not day:
+            day = date.today().isoformat()
+        try:
+            self._stats_request_day_cache = day
+        except Exception:
+            pass
+        key = f"{user}|{day}"
+
         now = time.time()
-        last = self._stats_req_last.get(user, 0.0)
+        last = self._stats_req_last.get(key, 0.0)
         if (now - last) < self._stats_req_min_interval:
             return
 
-        self._stats_req_last[user] = now
-        self._request_user_stats(user)
+        self._stats_req_last[key] = now
+        self._request_user_stats(user, day=day)
 
     def _start_auto_stats_refresh(self, users: List[str]):
         users = [u.strip() for u in (users or []) if u and u.strip()]
@@ -5238,7 +5834,7 @@ class KClientApp(ctk.CTk):
             for u in users:
                 if stop_evt.is_set():
                     return
-                self._request_user_stats_throttled(u)
+                self._request_user_stats_throttled(u, day=self._get_selected_day_for_requests())
                 time.sleep(self._stats_request_cooldown)
 
         def worker():
@@ -5262,6 +5858,10 @@ class KClientApp(ctk.CTk):
         self._auto_stats_thread.start()
 
     def _flush_user_stats_block(self):
+        try:
+            self._stats_flush_after_id = None
+        except Exception:
+            pass
         if not self._stats_block_active:
             return
         self._stats_block_active = False
@@ -5312,18 +5912,17 @@ class KClientApp(ctk.CTk):
                         )
 
                 # Repite para cada widget que actualices
+                color = "#2ecc71" if status == "ONLINE" else "#e74c3c"
+                try:
+                    self._cache_set_status(user, status, color=color)
+                except Exception:
+                    pass
                 if hasattr(self, "employees_panel") and self.employees_panel and self.employees_panel.winfo_exists():
-                    color = "#2ecc71" if status == "ONLINE" else "#e74c3c"
                     self.employees_panel.set_user_status(user, status, color=color)
             except Exception as e:
                 print(f"Widget ya no existe, ignorando actualización: {e}")
 
-        self.after(0, ui)
-
-        try:
-            self.after(0, ui)
-        except Exception:
-            ui()
+        self._run_on_ui(ui)
 
 
     def _ui_set_loading_user(self, user):
@@ -5343,7 +5942,7 @@ class KClientApp(ctk.CTk):
             self.history_box.see("1.0")  # <-- se queda ARRIBA
             self.history_box.configure(state="disabled")
 
-        self.after(0, ui)
+        self._run_on_ui(ui)
 
     def _touch_stats_block(self):
         self._stats_block_last_ts = time.time()
@@ -5384,12 +5983,10 @@ class KClientApp(ctk.CTk):
 
         self.server_entry = ctk.CTkEntry(row, placeholder_text="IP servidor", fg_color=CARD2)
         self.server_entry.insert(0, DEFAULT_HOST)
-        self.server_entry.configure(state="disabled")
         self.server_entry.pack(side="left", expand=True, fill="x", padx=(0, 8))
 
         self.port_entry = ctk.CTkEntry(row, placeholder_text="Puerto", width=90, fg_color=CARD2)
         self.port_entry.insert(0, str(DEFAULT_PORT))
-        self.port_entry.configure(state="disabled")
         self.port_entry.pack(side="left")
 
         self.btn_login = ctk.CTkButton(box, text="Conectar", fg_color=TURQ, text_color="#001013",
@@ -5447,11 +6044,17 @@ class KClientApp(ctk.CTk):
     def _do_login(self):
         u = self.user_entry.get().strip()
         pw = self.pass_entry.get().strip()
-        host = DEFAULT_HOST
-        port = DEFAULT_PORT
+        host = (self.server_entry.get().strip() or DEFAULT_HOST)
+        port_raw = (self.port_entry.get().strip() or str(DEFAULT_PORT))
 
         if not u or not pw:
             messagebox.showerror("Error", "Usuario y contraseña requeridos.")
+            return
+
+        try:
+            port = int(port_raw)
+        except ValueError:
+            messagebox.showerror("Error", "Puerto inválido.")
             return
 
         self.btn_login.configure(state="disabled", text="Conectando...")
@@ -5459,7 +6062,7 @@ class KClientApp(ctk.CTk):
         def task():
             ok = self._connect(host, port)
             if not ok:
-                self.after(0, lambda: self.btn_login.configure(state="normal", text="Conectar"))
+                self._run_on_ui(lambda: self.btn_login.configure(state="normal", text="Conectar"))
                 return
 
             # ✅ Protocolo real: "user,pass" y respuesta "OK,..."
@@ -5468,8 +6071,8 @@ class KClientApp(ctk.CTk):
                     self.sock.sendall(f"{u},{pw}".encode("utf-8"))
                 resp_raw = self.sock.recv(1024).decode("utf-8", errors="ignore").strip()
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Error", f"No se pudo loguear: {e}"))
-                self.after(0, lambda: self.btn_login.configure(state="normal", text="Conectar"))
+                self._run_on_ui(lambda: messagebox.showerror("Error", f"No se pudo loguear: {e}"))
+                self._run_on_ui(lambda: self.btn_login.configure(state="normal", text="Conectar"))
                 return
 
             if not resp_raw.startswith("OK"):
@@ -5480,8 +6083,8 @@ class KClientApp(ctk.CTk):
                     pass
                 self.sock = None
                 self.connected = False
-                self.after(0, lambda: messagebox.showerror("Error", "Acceso Denegado"))
-                self.after(0, lambda: self.btn_login.configure(state="normal", text="Conectar"))
+                self._run_on_ui(lambda: messagebox.showerror("Error", "Acceso Denegado"))
+                self._run_on_ui(lambda: self.btn_login.configure(state="normal", text="Conectar"))
                 return
 
             # ✅ Rol (si viene como "OK,<rol>....")
@@ -5496,7 +6099,7 @@ class KClientApp(ctk.CTk):
             self.current_user = u
             self._save_creds(u, pw)
 
-            self.after(0, self._enter_main_ui)
+            self._run_on_ui(self._enter_main_ui)
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -5511,7 +6114,7 @@ class KClientApp(ctk.CTk):
             # ❌ NO arrancar listen_loop todavía
             return True
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Error", f"No se pudo conectar: {e}"))
+            self._run_on_ui(lambda: messagebox.showerror("Error", f"No se pudo conectar: {e}"))
             self.connected = False
             self.sock = None
             return False
@@ -5559,10 +6162,7 @@ class KClientApp(ctk.CTk):
             except Exception:
                 pass
 
-        try:
-            self.after(0, _ui)
-        except Exception:
-            _ui()
+        self._run_on_ui(_ui)
 
     def _manual_reconnect(self):
         """Botón: intenta reconectar ahora."""
@@ -5594,7 +6194,7 @@ class KClientApp(ctk.CTk):
                 u, pw = self._get_saved_creds()
                 if not u or not pw:
                     if user_initiated:
-                        self.after(0, lambda: messagebox.showinfo("Reconectar", "No hay credenciales guardadas. Volvé a iniciar sesión."))
+                        self._run_on_ui(lambda: messagebox.showinfo("Reconectar", "No hay credenciales guardadas. Volvé a iniciar sesión."))
                     return
 
                 ok = self._connect(DEFAULT_HOST, DEFAULT_PORT)
@@ -5626,7 +6226,7 @@ class KClientApp(ctk.CTk):
                     self.sock = None
                     self.connected = False
                     if user_initiated:
-                        self.after(0, lambda: messagebox.showerror("Reconectar", "Acceso denegado al reconectar."))
+                        self._run_on_ui(lambda: messagebox.showerror("Reconectar", "Acceso denegado al reconectar."))
                     return
 
                 parts = resp_raw.split(",")
@@ -5642,11 +6242,11 @@ class KClientApp(ctk.CTk):
                 # UI + refrescos
                 self._set_connection_state(True)
                 try:
-                    self.after(0, lambda: self._request_user_list())
+                    self._run_on_ui(lambda: self._request_user_list())
                 except Exception:
                     pass
                 if user_initiated:
-                    self.after(0, lambda: messagebox.showinfo("Reconectar", "Conectado nuevamente."))
+                    self._run_on_ui(lambda: messagebox.showinfo("Reconectar", "Conectado nuevamente."))
             finally:
                 self._reconnect_in_progress = False
 
@@ -6305,16 +6905,7 @@ class KClientApp(ctk.CTk):
         except Exception:
             pass
 
-        # 4) best-effort: si el server tiene comandos específicos de online/log
-        try:
-            with self.socket_lock:
-                for cmd in ("REQUEST_ONLINE_USERS", "REQUEST_ONLINE_LOG", "REQUEST_ONLINE_HISTORY"):
-                    try:
-                        self.sock.sendall((cmd + "\n").encode("utf-8"))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        # 4) Se removieron comandos legacy no soportados por server para evitar ruido de protocolo.
 
     def _build_all_users_stats(self):
         latest = getattr(self, "_latest_stats", {}) or {}
@@ -6380,8 +6971,12 @@ class KClientApp(ctk.CTk):
         if not day:
             day = date.today().isoformat()
         try:
+            self._stats_request_day_cache = day
+        except Exception:
+            pass
+        try:
             with self.socket_lock:
-                self.sock.sendall(f"REQUEST_USER_STATS|{user}|{day}\\n".encode("utf-8"))
+                self.sock.sendall(f"REQUEST_USER_STATS|{user}|{day}\n".encode("utf-8"))
                 print(">>> SEND REQUEST_USER_STATS:", f"REQUEST_USER_STATS|{user}|{day}")
         except Exception as e:
             print("request_user_stats error:", e)
@@ -6390,9 +6985,14 @@ class KClientApp(ctk.CTk):
         """
         Pide stats de todos los usuarios conocidos (cacheados).
         Usa after() para no spamear el socket de golpe.
+        Cancela barridos anteriores para no mezclar respuestas entre días.
         """
         if day is None:
             day = date.today().isoformat()
+        try:
+            self._stats_request_day_cache = day
+        except Exception:
+            pass
         users = list(getattr(self, "_cached_users", []) or [])
         if not users:
             print("request_all_users_stats: no hay _cached_users")
@@ -6404,9 +7004,13 @@ class KClientApp(ctk.CTk):
         for u in users:
             self._latest_stats.setdefault(u, {"fg_time": "0", "bg_time": "0", "status": "", "raw": ""})
 
+        self._all_stats_req_gen += 1
+        my_gen = self._all_stats_req_gen
+
         def _tick(i=0):
+            if my_gen != self._all_stats_req_gen:
+                return
             if i >= len(users):
-                # al terminar, empuja un refresh del perf_view si está abierto
                 try:
                     if hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists():
                         all_stats = self._build_all_users_stats()
@@ -6420,7 +7024,7 @@ class KClientApp(ctk.CTk):
 
             u = users[i]
             try:
-                self._request_user_stats(u, day)  # REQUEST_USER_STATS|u|YYYY-MM-DD
+                self._request_user_stats(u, day)
             except Exception as e:
                 print("request_all_users_stats _request_user_stats error:", u, e)
 
@@ -7090,8 +7694,11 @@ class KClientApp(ctk.CTk):
                 on_pick_user=self._perf_pick_user,
                 on_refresh=self._trigger_refresh_perf,
                 on_load_all=lambda d=None: self.request_all_users_stats(d),
+                on_request_ai_log=self._request_ai_log_from_server,
             )
             self.perf_view.pack(fill="both", expand=True, padx=16, pady=16)
+            self._request_tasks_sync(user)
+            self._apply_tasks_to_perf_view(user)
 
             # 2. Mostrar indicador de carga
             self.perf_view.set_loading(f"Solicitando datos de {user}...")
@@ -7109,6 +7716,8 @@ class KClientApp(ctk.CTk):
         day = getattr(self.perf_view, "selected_day", date.today().isoformat())
         self.perf_view.set_loading("Actualizando...")
         self._request_user_stats(user, day)
+        self._request_tasks_sync(user)
+        self._apply_tasks_to_perf_view(user)
 
     # --- Dentro de la clase PerfomanceView ---
 
@@ -7150,6 +7759,30 @@ class KClientApp(ctk.CTk):
         if not day:
             day = date.today().isoformat()
         self._request_user_stats(user, day)
+
+    def _request_tasks_sync(self, target_user: str = ""):
+        try:
+            if not self.connected or not self.sock:
+                return
+            target = (target_user or "").strip() or getattr(self, "current_user", "") or ""
+            req_id = str(int(time.time() * 1000))
+            with self.socket_lock:
+                self.sock.sendall((f"TASKS_SYNC_REQ|{req_id}|{target}\n").encode("utf-8"))
+        except Exception:
+            pass
+
+    def _apply_tasks_to_perf_view(self, user: str):
+        try:
+            if not hasattr(self, "perf_view") or not self.perf_view or not self.perf_view.winfo_exists():
+                return
+            u = (user or "").strip()
+            if not u:
+                return
+            tasks = (self._tasks_by_user.get(u) or []) if isinstance(self._tasks_by_user, dict) else []
+            self.perf_view.set_user_tasks(u, tasks)
+        except Exception:
+            pass
+
     # ----------------------------
     # Send JSON helper (activity_v2)
     # ----------------------------
@@ -7292,19 +7925,20 @@ class KClientApp(ctk.CTk):
         except:
             txt = ""
 
-        # actualizar PerformanceView si existe
-        try:
-            if hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists():
-                self.after(0, lambda: self.perf_view.set_ai_log_text(user, day, txt))
-        except Exception as e:
-            print("_handle_ai_log_bytes ui error:", e)
+        def ui():
+            try:
+                if hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists():
+                    self.perf_view.set_ai_log_text(user, day, txt)
+            except Exception as e:
+                print("_handle_ai_log_bytes ui error:", e)
 
-        # opcional: también mandar a consola
-        try:
-            if self.console_win and self.console_win.winfo_exists():
-                self.console_win.add_output(f"\n[AI LOG] {user} {day}\n")
-        except:
-            pass
+            try:
+                if self.console_win and self.console_win.winfo_exists():
+                    self.console_win.add_output(f"\n[AI LOG] {user} {day}\n")
+            except Exception:
+                pass
+
+        self._run_on_ui(ui)
 
     # ----------------------------
     # Listen loop (server -> UI)
@@ -7365,13 +7999,9 @@ class KClientApp(ctk.CTk):
 
                     # 3) Header especial de binario
                     # Formato: PHOTO_DATA|fname|size
-                    print(line_str)
                     # ✅ Respuesta de chat IA (texto)
                     if line_str.startswith("AI_CHAT_RESP|"):
-                        try:
-                            self._handle_ai_chat_resp_line(line_str)
-                        except Exception as e:
-                            print("AI_CHAT_RESP error:", e)
+                        self._run_on_ui(lambda l=line_str: self._handle_ai_chat_resp_line(l))
                         continue
 
                     if line_str.startswith("PHOTO_DATA|"):
@@ -7418,8 +8048,8 @@ class KClientApp(ctk.CTk):
                             print("AI_LOG_DATA header incompleto:", line_str)
                             continue
 
-                    # 4) Línea normal de texto
-                    self.handle_line(line_str)
+                    # 4) Línea normal de texto (siempre en UI thread)
+                    self._run_on_ui(lambda l=line_str: self.handle_line(l))
 
             except Exception as e:
                 print("listen_loop:", e)
@@ -7437,15 +8067,12 @@ class KClientApp(ctk.CTk):
         except Exception:
             pass
         self.sock = None
-        try:
-            self._set_connection_state(False)
-        except Exception:
-            pass
+        self._run_on_ui(lambda: self._set_connection_state(False))
 
         # aviso (una sola vez por caída)
         try:
-            if not getattr(self, "_reconnect_in_progress", False):
-                self.after(0, lambda: messagebox.showwarning("Desconectado", "Se perdió la conexión con el servidor."))
+            if (not getattr(self, "_closing", False)) and (not getattr(self, "_reconnect_in_progress", False)):
+                self._run_on_ui(lambda: messagebox.showwarning("Desconectado", "Se perdió la conexión con el servidor."))
         except Exception:
             pass
         try:
@@ -7484,16 +8111,20 @@ class KClientApp(ctk.CTk):
                 # fallback
                 shutil.move(tmp_path, out_path)
 
-            # refrescar UI (si la galería está abierta)
-            if self.gallery_win and self.gallery_win.winfo_exists():
-                self.after(0, self.gallery_win.load_local_filenames)
+            # refrescar UI (si la galería / preview están abiertas)
+            def ui_refresh():
+                try:
+                    if self.gallery_win and self.gallery_win.winfo_exists():
+                        self.gallery_win.load_local_filenames()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "preview_editor") and self.preview_editor and self.preview_editor.winfo_exists():
+                        self.preview_editor.load_image_path(out_path)
+                except Exception:
+                    pass
 
-            # ✅ NUEVO: mostrar la última captura en el bloque abajo izquierda
-            try:
-                if hasattr(self, "preview_editor") and self.preview_editor and self.preview_editor.winfo_exists():
-                    self.after(0, lambda p=out_path: self.preview_editor.load_image_path(p))
-            except Exception:
-                pass
+            self._run_on_ui(ui_refresh)
 
         except Exception as e:
             print("_handle_photo_data_bytes:", e)
@@ -7526,43 +8157,124 @@ class KClientApp(ctk.CTk):
 
         # ✅ Detectar inicio de bloque USER_STATS
         if line.startswith("USER_STATS|"):
-            parts = line.split("|")
-            # El orden enviado por el servidor es: 0:Header, 1:User, 2:Date, 3:Status, 4:Activo, 5:Inactivo, 6:Historial
+            # Si llega un nuevo header y había bloque pendiente, flush inmediato del anterior
+            if self._stats_block_active:
+                try:
+                    self._flush_user_stats_block()
+                except Exception:
+                    pass
+
+            parts = line.split("|", 6)
+            # Formato: USER_STATS|user|date|status|active|inactive|history_escaped
             if len(parts) >= 6:
                 user = parts[1].strip()
                 req_date = parts[2].strip()
-                status = parts[3].strip()  # Aquí debe decir ONLINE u OFFLINE
+                status = parts[3].strip()
                 fg_time = parts[4].strip()
                 bg_time = parts[5].strip()
                 history_raw = parts[6].replace("\\n", "\n") if len(parts) > 6 else ""
 
-                # Actualizar Panel de Empleados (Mini-Cards)
-                if hasattr(self, "employees_panel"):
-                    color = OK if status == "ONLINE" else DANGER
-                    # Esto corrige que aparezca el nombre "ONLINE" y el color correcto
+                # preparar bloque (soporta payload en 1 línea o multiline en líneas siguientes)
+                self._stats_block_active = True
+                self._stats_block_user = user
+                self._stats_block_status = status
+                self._stats_block_fg_time = fg_time
+                self._stats_block_bg_time = bg_time
+                self._stats_block_date = req_date
+                self._stats_block_lines = [history_raw] if history_raw else []
+
+                # UI rápida de estado (card + detalle)
+                color = OK if status == "ONLINE" else DANGER
+                try:
+                    self._cache_set_status(user, status, color=color)
+                except Exception:
+                    pass
+                if hasattr(self, "employees_panel") and self.employees_panel and self.employees_panel.winfo_exists():
                     self.employees_panel.set_user_status(user, status, color=color)
 
-                # Si este es el usuario seleccionado, actualizar el detalle y el historial
                 if self.selected_user_var.get() == user:
-                    self.lbl_detail.configure(text=f"Empleado: {user} | Fecha: {req_date}\nEstado: {status}")
-                    self._ui_set_history_text(history_raw)
-            self._flush_user_stats_block()
-            time.sleep(0.01)
+                    try:
+                        self.lbl_detail.configure(text=f"Empleado: {user} | Fecha: {req_date}\nEstado: {status}")
+                    except Exception:
+                        pass
 
+                # flush diferido: captura multiline, pero también cierra casos de una sola línea
+                try:
+                    if getattr(self, "_stats_flush_after_id", None):
+                        self.after_cancel(self._stats_flush_after_id)
+                except Exception:
+                    pass
+                self._stats_flush_after_id = self.after(120, self._flush_user_stats_block)
 
-            # ✅ FIX: actualizar selected_day en perf_view si corresponde al usuario activo
-            # (así la UI queda en sintonía con los datos que llegaron)
+            return
+
+        if line.startswith("TASKS_SYNC|"):
             try:
-                if (hasattr(self, "perf_view") and self.perf_view
-                        and self.perf_view.winfo_exists()
-                        and getattr(self.perf_view, "target_user", None) == user
-                        and date_str):
-                    d_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    # sincronizar sin re-disparar request al server
-                    self.after(0, lambda d=d_obj: self.perf_view._set_selected_day(d, notify_server=False))
+                parts = line.split("|", 2)
+                raw = parts[2] if len(parts) > 2 else "{}"
+                payload = json.loads(raw)
             except Exception:
-                pass
+                payload = {}
 
+            if isinstance(payload, dict):
+                scope = (payload.get("scope") or "").upper()
+                if scope == "ALL":
+                    by_user = payload.get("by_user") if isinstance(payload.get("by_user"), dict) else {}
+                    for u, tasks in by_user.items():
+                        self._tasks_by_user[(u or "").strip()] = tasks if isinstance(tasks, list) else []
+                else:
+                    u = (payload.get("user") or "").strip()
+                    tasks = payload.get("tasks") if isinstance(payload.get("tasks"), list) else []
+                    if u:
+                        self._tasks_by_user[u] = tasks
+                        self._apply_tasks_to_perf_view(u)
+            return
+
+        if line.startswith("TASK_EVT|"):
+            try:
+                evt = json.loads(line.split("|", 1)[1])
+            except Exception:
+                evt = {}
+            if isinstance(evt, dict):
+                assignee = (evt.get("assignee") or (evt.get("task") or {}).get("assignee") or "").strip()
+                action = (evt.get("action") or "").lower()
+                task = evt.get("task") if isinstance(evt.get("task"), dict) else {}
+                tid = (evt.get("task_id") or task.get("id") or "").strip()
+
+                if assignee:
+                    arr = self._tasks_by_user.get(assignee, [])
+                    if not isinstance(arr, list):
+                        arr = []
+
+                    def _find_idx(lst, x):
+                        for i, it in enumerate(lst):
+                            if isinstance(it, dict) and str(it.get("id") or it.get("task_id") or "") == x:
+                                return i
+                        return -1
+
+                    idx = _find_idx(arr, tid) if tid else -1
+
+                    if action in ("delete", "remove", "deleted") and idx >= 0:
+                        arr.pop(idx)
+                    elif action in ("finish", "done", "completed", "complete"):
+                        if idx >= 0 and isinstance(arr[idx], dict):
+                            arr[idx]["done"] = True
+                            arr[idx]["status"] = "done"
+                        elif tid:
+                            arr.append({"id": tid, "done": True, "status": "done", "assignee": assignee})
+                    else:
+                        if task:
+                            t = dict(task)
+                            if tid:
+                                t["id"] = tid
+                            t["assignee"] = assignee
+                            if idx >= 0:
+                                arr[idx] = t
+                            else:
+                                arr.append(t)
+
+                    self._tasks_by_user[assignee] = arr
+                    self._apply_tasks_to_perf_view(assignee)
             return
 
         if line.startswith("USER_LIST|"):
@@ -7592,12 +8304,16 @@ class KClientApp(ctk.CTk):
                 if hasattr(self, "perf_view") and self.perf_view and self.perf_view.winfo_exists():
                     self.perf_view.set_users(users)
 
-            self.after(0, ui_update)
+            ui_update()
 
-            # si querés ignorar duplicados, que solo afecte el auto-refresh, NO la UI
-            if not self._should_ignore_duplicate_user_list(users):
+            # refrescar estados: si lista cambia, o si todavía hay usuarios sin estado cargado
+            has_missing_status = any(not (self._latest_stats.get(u, {}) or {}).get("status") for u in users)
+            if has_missing_status or (not self._should_ignore_duplicate_user_list(users)):
                 self._start_auto_stats_refresh(users)
 
+            return
+
+        if line == "PONG":
             return
 
         if line.startswith("CONSOLE_OUTPUT|"):
@@ -7610,7 +8326,7 @@ class KClientApp(ctk.CTk):
             parts = line.split("|", 2)
             title = parts[1] if len(parts) > 1 else "Info"
             msg = parts[2] if len(parts) > 2 else ""
-            self.after(0, lambda: messagebox.showinfo(title, msg))
+            messagebox.showinfo(title, msg)
             return
         if line.startswith("TAKE_SCREENSHOT|"):
             # Server manda:
@@ -7714,6 +8430,26 @@ class KClientApp(ctk.CTk):
             self.connected = False
         except Exception:
             pass
+        try:
+            self._auto_stats_stop.set()
+        except Exception:
+            pass
+        try:
+            self._hourly_shots_stop.set()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_adv_tick_job", None):
+                self.after_cancel(self._adv_tick_job)
+        except Exception:
+            pass
+        self._adv_tick_job = None
+        try:
+            if getattr(self, "_stats_flush_after_id", None):
+                self.after_cancel(self._stats_flush_after_id)
+        except Exception:
+            pass
+        self._stats_flush_after_id = None
 
         # 3) cerrar socket y desbloquear recv()
         try:
@@ -7761,4 +8497,3 @@ class KClientApp(ctk.CTk):
 if __name__ == "__main__":
     app = KClientApp()
     app.mainloop()
-
