@@ -5396,6 +5396,9 @@ class KClientApp(ctk.CTk):
         # ✅ Si el servidor envía las líneas de stats ANTES del header USER_STATS (orden invertido), las guardamos aquí
         self._pre_stats_lines = []
 
+        # hilo listener socket
+        self._listen_thread = None
+
         # tasks sync cache (server)
         self._tasks_by_user = {}
         # =========================
@@ -6094,7 +6097,7 @@ class KClientApp(ctk.CTk):
                 role = parts[1].split("CONSOLE")[0].split("SHOW")[0].strip() or "empleado"
             self.current_role = "boss" if role.lower() in ("jefe", "boss", "admin") else "employee"
             # ... después de calcular role/current_role y antes de _enter_main_ui
-            threading.Thread(target=self._listen_loop, daemon=True).start()
+            self._start_listen_thread()
 
             self.current_user = u
             self._save_creds(u, pw)
@@ -6237,7 +6240,7 @@ class KClientApp(ctk.CTk):
                 self.current_user = u
 
                 # arrancar listener nuevo
-                threading.Thread(target=self._listen_loop, daemon=True).start()
+                self._start_listen_thread()
 
                 # UI + refrescos
                 self._set_connection_state(True)
@@ -7940,6 +7943,17 @@ class KClientApp(ctk.CTk):
 
         self._run_on_ui(ui)
 
+    def _start_listen_thread(self):
+        try:
+            t = getattr(self, "_listen_thread", None)
+            if t and t.is_alive():
+                return
+            t = threading.Thread(target=self._listen_loop, daemon=True)
+            self._listen_thread = t
+            t.start()
+        except Exception:
+            pass
+
     # ----------------------------
     # Listen loop (server -> UI)
     # ----------------------------
@@ -8052,7 +8066,8 @@ class KClientApp(ctk.CTk):
                     self._run_on_ui(lambda l=line_str: self.handle_line(l))
 
             except Exception as e:
-                print("listen_loop:", e)
+                if not getattr(self, "_closing", False):
+                    print("listen_loop:", e)
                 break
 
         self.connected = False
@@ -8400,11 +8415,33 @@ class KClientApp(ctk.CTk):
             except:
                 pass
 
+    def _cancel_all_after_callbacks(self):
+        try:
+            ids = self.tk.call("after", "info")
+        except Exception:
+            ids = ()
+        try:
+            if isinstance(ids, str):
+                ids = (ids,) if ids else ()
+        except Exception:
+            ids = ()
+        for aid in ids or ():
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+
     def _on_close(self):
         # Evitar doble cierre
         if getattr(self, "_closing", False):
             return
         self._closing = True
+
+        # 0) cancelar cualquier callback pendiente de Tk/after
+        try:
+            self._cancel_all_after_callbacks()
+        except Exception:
+            pass
 
         # 1) cortar loops after (todos los que existan)
         for attr in (
@@ -8465,6 +8502,22 @@ class KClientApp(ctk.CTk):
         except Exception:
             pass
         self.sock = None
+
+        # 3.1) esperar un instante a que termine listen_loop
+        try:
+            t = getattr(self, "_listen_thread", None)
+            if t and t.is_alive() and t is not threading.current_thread():
+                t.join(timeout=0.8)
+        except Exception:
+            pass
+        self._listen_thread = None
+
+        # vaciar cola UI pendiente
+        try:
+            while True:
+                self._ui_queue.get_nowait()
+        except Exception:
+            pass
 
         # 4) cerrar ventanas hijas si existen
         for w_attr in ("perf_win", "gallery_win"):
