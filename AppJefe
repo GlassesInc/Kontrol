@@ -1340,6 +1340,7 @@ class PerfomanceView(ctk.CTkFrame):
         self._ai_event_queue = queue.Queue()
         self._ai_queue_after_id = None
         self._active_request_id = None
+        self._active_export_request_id = None
 
         self.max_width = max_width
         self.max_height = max_height
@@ -1776,6 +1777,13 @@ class PerfomanceView(ctk.CTkFrame):
         except Exception:
             return ""
 
+    def dbg(self, tag: str):
+        try:
+            exists = self.winfo_exists() if hasattr(self, "winfo_exists") else "NA"
+        except Exception:
+            exists = "ERR"
+        print(f"[DBG] {time.time():.3f} {tag} thread={threading.current_thread().name}:{threading.get_ident()} closing={getattr(self, '_closing', False)} exists={exists}")
+
     def _safe_after_ui(self, fn):
         try:
             if getattr(self, "_pv_closing", False) or getattr(self, "_closing", False):
@@ -1857,6 +1865,43 @@ class PerfomanceView(ctk.CTkFrame):
         if getattr(self, "_closing", False) or getattr(self, "_pv_closing", False) or (not exists):
             return
 
+        if evt_type == "export_done":
+            if req_id != getattr(self, "_active_export_request_id", None):
+                return
+            try:
+                data = json.loads(payload or "{}") if isinstance(payload, str) else {}
+            except Exception:
+                data = {}
+            self.dbg(f"PASO EXPORT 7: actualizando UI / messagebox rid={req_id}")
+            try:
+                messagebox.showinfo("Exportación", f"Análisis exportado:\n{data.get('img','')}\n{data.get('txt','')}\n{data.get('pdf','')}")
+            except Exception:
+                traceback.print_exc()
+            try:
+                if hasattr(self, "_adv_export_btn") and self._adv_export_btn:
+                    self._adv_export_btn.configure(state="normal", text="Exportar análisis")
+            except Exception:
+                traceback.print_exc()
+            self._active_export_request_id = None
+            self.dbg(f"PASO EXPORT 8: fin OK rid={req_id}")
+            return
+
+        if evt_type == "export_error":
+            if req_id != getattr(self, "_active_export_request_id", None):
+                return
+            self.dbg(f"PASO EXPORT FAIL rid={req_id}")
+            try:
+                messagebox.showerror("Exportación", payload or "No se pudo exportar análisis")
+            except Exception:
+                traceback.print_exc()
+            try:
+                if hasattr(self, "_adv_export_btn") and self._adv_export_btn:
+                    self._adv_export_btn.configure(state="normal", text="Exportar análisis")
+            except Exception:
+                traceback.print_exc()
+            self._active_export_request_id = None
+            return
+
         if evt_type == "adv_eff":
             try:
                 username, day, score_txt = (payload or "").split("|", 2)
@@ -1925,6 +1970,7 @@ class PerfomanceView(ctk.CTkFrame):
         try:
             self._ai_pending_req_id = None
             self._active_request_id = None
+            self._active_export_request_id = None
         except Exception:
             pass
         try:
@@ -2385,13 +2431,14 @@ class PerfomanceView(ctk.CTkFrame):
         self.adv_kpi_mode_lbl = ctk.CTkLabel(right, text="Modo KPI IA: general", font=("Roboto", 11), text_color="#a9bfd8")
         self.adv_kpi_mode_lbl.grid(row=6, column=0, sticky="w", padx=12, pady=(0, 6))
 
-        ctk.CTkButton(
+        self._adv_export_btn = ctk.CTkButton(
             right,
             text="Exportar análisis",
             fg_color="#8e44ad",
             hover_color="#6d2f8a",
             command=self._adv_export_analysis
-        ).grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 8))
+        )
+        self._adv_export_btn.grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 8))
 
         # Listado usuarios
         ctk.CTkLabel(right, text="Usuarios añadidos", font=("Roboto", 12, "bold"), text_color=TXT).grid(
@@ -2596,20 +2643,52 @@ class PerfomanceView(ctk.CTkFrame):
         return max(0.20, min(0.98, score))
 
     def _adv_export_analysis(self):
+        rid = int(time.time() * 1000)
+        self.dbg(f"PASO EXPORT 1: click recibido rid={rid}")
+        self._active_export_request_id = rid
         try:
+            if hasattr(self, "_adv_export_btn") and self._adv_export_btn:
+                self._adv_export_btn.configure(state="disabled", text="Exportando…")
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            self.dbg(f"PASO EXPORT 2: recogiendo datos rid={rid}")
+            snapshot = {
+                "rid": rid,
+                "day": self._adv_get_selected_day(),
+                "kpi_mode": self.adv_kpi_mode,
+                "adv_users": [dict(u) for u in (self.adv_users or [])],
+                "ai_log_text": (self._ai_log_text or ""),
+                "cache_dir": get_cache_dir(),
+                "fig": self.adv_fig,
+            }
+            self._start_ai_queue_poller()
+            self._start_ai_thread(self._adv_export_analysis_worker, (snapshot,))
+        except Exception:
+            self.dbg(f"PASO EXPORT FAIL rid={rid}")
+            traceback.print_exc()
+            self._queue_ai_event("export_error", rid, "No se pudo iniciar exportación.")
+
+    def _adv_export_analysis_worker(self, snapshot: dict):
+        rid = int(snapshot.get("rid") or 0)
+        try:
+            self.dbg(f"PASO EXPORT 3: generando texto rid={rid}")
             from fpdf import FPDF
 
             export_dir = os.path.join(get_appdata_base_dir(), "exports_analisis")
             os.makedirs(export_dir, exist_ok=True)
-
-            day = self._adv_get_selected_day()
+            day = snapshot.get("day") or self._adv_get_selected_day()
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_name = f"adv_{day}_{ts}"
-            base = os.path.join(export_dir, base_name)
-
+            base = os.path.join(export_dir, f"adv_{day}_{ts}")
             img_path = base + ".png"
-            if self.adv_fig is not None:
-                self.adv_fig.savefig(img_path, dpi=140, bbox_inches="tight")
+
+            fig = snapshot.get("fig")
+            if fig is not None:
+                try:
+                    fig.savefig(img_path, dpi=140, bbox_inches="tight")
+                except Exception:
+                    traceback.print_exc()
 
             def clean_pdf_text(x: str) -> str:
                 t = str(x or "")
@@ -2641,21 +2720,18 @@ class PerfomanceView(ctk.CTkFrame):
                 out.sort(key=lambda x: x[1], reverse=True)
                 return out[:top_n]
 
-            # contexto por usuario
-            lines = [f"Fecha seleccionada: {day}", f"Modo KPI IA: {self.adv_kpi_mode}", "", "Usuarios:"]
+            lines = [f"Fecha seleccionada: {day}", f"Modo KPI IA: {snapshot.get('kpi_mode')}", "", "Usuarios:"]
             low_perf_global = []
-            for u in (self.adv_users or []):
+            for u in (snapshot.get("adv_users") or []):
                 real_s, eff_s, kpi_pct = self._adv_user_cost_per_sec(u)
                 name = (u.get('name') or '').strip()
                 role = u.get('role')
                 eur_h = u.get('eur_per_hour')
                 lines.append(f"- {name} | rol={role} | EUR/h={eur_h} | KPI={kpi_pct}% | real={real_s:.4f} | eff={eff_s:.4f}")
-
                 raw = self._adv_get_user_raw_for_ai(name)
                 tasks_txt = self._adv_tasks_text_for_prompt(name)
                 lines.append(f"  Tareas sincronizadas ({name}):")
                 lines.extend([f"    {ln}" for ln in (tasks_txt.splitlines() or ["No hay tareas en las que basarse."])][:25])
-
                 low_perf = low_perf_from_raw(raw, top_n=5)
                 if low_perf:
                     lines.append(f"  Actividades que bajan rendimiento ({name}):")
@@ -2663,8 +2739,7 @@ class PerfomanceView(ctk.CTkFrame):
                         low_perf_global.append((name, app, sec))
                         lines.append(f"    - {app} [{self.format_seconds(sec)}]")
 
-            # contexto capturas + log IA (análisis de capturas)
-            ai_log_txt = (self._ai_log_text or '').strip()
+            ai_log_txt = (snapshot.get("ai_log_text") or "").strip()
             if ai_log_txt:
                 lines.append("")
                 lines.append("Extracto análisis IA de capturas:")
@@ -2673,132 +2748,70 @@ class PerfomanceView(ctk.CTkFrame):
             shots = []
             try:
                 day_compact = day.replace("-", "")
-                for fn in sorted(os.listdir(get_cache_dir())):
+                for fn in sorted(os.listdir(snapshot.get("cache_dir") or get_cache_dir())):
                     if day_compact in fn:
                         shots.append(fn)
             except Exception:
-                pass
+                traceback.print_exc()
 
-            if shots:
-                lines.append("")
-                lines.append(f"Capturas detectadas del día ({len(shots)}):")
-                for fn in shots[:20]:
-                    lines.append(f"- {fn}")
-
-            # resumen IA (con fallback) y mención explícita de actividades que bajan rendimiento
-            summary = (
-                "Resumen: rendimiento dentro de lo esperable. "
-                "Revisar actividades de distracción detectadas y contrastarlas con el rol/tareas."
-            )
+            summary = "Resumen no disponible."
             try:
-                if os.getenv("OPENAI_API_KEY"):
-                    from openai import OpenAI
-                    client = OpenAI(timeout=25)
-                    rubric = self._adv_expected_rubric_seconds()
-                    prompt = (
-                        "Genera un resumen ejecutivo del rendimiento diario por persona y global. "
-                        "Mide el tiempo invertido por web/app y compáralo con objetivo de 3 expedientes/día. "
-                        f"Rubrica objetivo total: {rubric.get('total', 28800)}s/día (8h). "
-                        f"Desglose: atención {rubric.get('atencion_cliente')}s, presupuesto {rubric.get('presupuesto')}s, cobro {rubric.get('cobro')}s, operativa {rubric.get('operativa')}s, tarjeta {rubric.get('tarjeta_embarque')}s, administración {rubric.get('administracion')}s. "
-                        "Clasifica por rol y considera productivas (ejemplos): "
-                        "Operativa -> kommo, amadeus/sabre/travelport, webs aerolíneas, activex, csdviajes; "
-                        "Ventas -> kommo, amadeus, centralita/telefonía (3cx/aircall/dialpad); "
-                        "Dirección -> casi todas salvo ocio explícito; "
-                        "Administración -> bancos, facturación/contabilidad, calculadora, kommo. "
-                        "Incluye: (1) desvío de tiempo esperado por rol, (2) apps concretas que bajan rendimiento, "
-                        "(3) señales de capturas/IA, (4) recomendaciones accionables.\n\n"
-                        + "\n".join(lines)
-                    )
-                    resp = client.responses.create(
-                        model="gpt-4o-mini",
-                        input=[{"role": "user", "content": prompt}]
-                    )
-                    out = ""
-                    for item in getattr(resp, "output", []) or []:
-                        if getattr(item, "type", None) == "message":
-                            for c in getattr(item, "content", []) or []:
-                                if getattr(c, "type", None) in ("output_text", "text"):
-                                    out += getattr(c, "text", "")
-                    if (out or "").strip():
-                        summary = out.strip()
+                self.dbg(f"PASO EXPORT 4: llamada a IA rid={rid}")
+                from openai import OpenAI
+                client = OpenAI(timeout=35)
+                prompt = (
+                    "Generá un informe ejecutivo de productividad en bloques: Resumen Ejecutivo, Análisis por Rol, Tareas y Cumplimiento, Riesgos, Recomendaciones.\n\n"
+                    + "\n".join(lines)
+                )
+                resp = client.responses.create(model="gpt-4o-mini", input=[{"role": "user", "content": prompt}])
+                out = ""
+                for item in getattr(resp, "output", []) or []:
+                    if getattr(item, "type", None) == "message":
+                        for c in getattr(item, "content", []) or []:
+                            if getattr(c, "type", None) in ("output_text", "text"):
+                                out += getattr(c, "text", "")
+                if (out or "").strip():
+                    summary = out.strip()
             except Exception:
-                pass
+                traceback.print_exc()
 
-            # TXT export
+            self.dbg(f"PASO EXPORT 5: creando PDF/archivo rid={rid}")
             txt_path = base + ".txt"
+            pdf_path = base + ".pdf"
+
+            self.dbg(f"PASO EXPORT 6: escribiendo a disco rid={rid}")
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
                 f.write("\n\n" + summary + "\n")
-
-            # PDF export (incluye gráfica)
-            pdf_path = base + ".pdf"
             pdf = FPDF(orientation="P", unit="mm", format="A4")
             pdf.set_margins(12, 12, 12)
             pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
-
             epw = pdf.w - pdf.l_margin - pdf.r_margin
             pdf.set_font("Arial", "B", 15)
             pdf.cell(epw, 8, clean_pdf_text("Analisis estadistica avanzada"), ln=True)
             pdf.set_font("Arial", "", 11)
             pdf.cell(epw, 7, clean_pdf_text(f"Fecha seleccionada: {day}"), ln=True)
-            pdf.cell(epw, 7, clean_pdf_text(f"Modo KPI IA: {self.adv_kpi_mode}"), ln=True)
+            pdf.cell(epw, 7, clean_pdf_text(f"Modo KPI IA: {snapshot.get('kpi_mode')}"), ln=True)
             pdf.ln(2)
-
             if os.path.exists(img_path):
                 try:
                     pdf.image(img_path, x=pdf.l_margin, y=pdf.get_y(), w=epw)
                     pdf.ln(95)
                 except Exception:
-                    pass
-
+                    traceback.print_exc()
             pdf.set_font("Arial", "B", 12)
             pdf.cell(epw, 7, clean_pdf_text("Resumen IA"), ln=True)
             pdf.set_font("Arial", "", 10)
             pdf.multi_cell(epw, 5, clean_pdf_text(summary))
-            pdf.ln(2)
-
-            pdf.set_font("Arial", "B", 11)
-            pdf.cell(epw, 7, clean_pdf_text("Actividades que bajan rendimiento"), ln=True)
-            pdf.set_font("Arial", "", 9)
-            if low_perf_global:
-                for uname, app, sec in low_perf_global[:30]:
-                    pdf.multi_cell(epw, 5, clean_pdf_text(f"- {uname}: {app} [{self.format_seconds(sec)}]"))
-            else:
-                pdf.multi_cell(epw, 5, clean_pdf_text("No se detectaron actividades de baja productividad con tiempo significativo."))
-
-            if shots:
-                pdf.ln(2)
-                pdf.set_font("Arial", "B", 11)
-                pdf.cell(epw, 7, clean_pdf_text("Capturas consideradas"), ln=True)
-                pdf.set_font("Arial", "", 9)
-                for fn in shots[:20]:
-                    pdf.multi_cell(epw, 5, clean_pdf_text(f"- {fn}"))
-
-            if ai_log_txt:
-                pdf.ln(2)
-                pdf.set_font("Arial", "B", 11)
-                pdf.cell(epw, 7, clean_pdf_text("Extracto analisis IA de capturas"), ln=True)
-                pdf.set_font("Courier", "", 8)
-                snippet = clean_pdf_text(ai_log_txt[:5000])
-                pdf.multi_cell(epw, 4, snippet)
-
             pdf.output(pdf_path)
 
-            # guardar también en Descargas
-            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-            if os.path.isdir(downloads_dir):
-                try:
-                    shutil.copy2(pdf_path, os.path.join(downloads_dir, os.path.basename(pdf_path)))
-                except Exception:
-                    pass
-
-            messagebox.showinfo(
-                "Exportación",
-                f"Análisis exportado:\n{img_path}\n{txt_path}\n{pdf_path}"
-            )
-        except Exception as e:
-            messagebox.showerror("Exportación", f"No se pudo exportar análisis: {e}")
+            result = json.dumps({"img": img_path, "txt": txt_path, "pdf": pdf_path}, ensure_ascii=False)
+            self._queue_ai_event("export_done", rid, result)
+        except Exception:
+            self.dbg(f"PASO EXPORT FAIL rid={rid}")
+            traceback.print_exc()
+            self._queue_ai_event("export_error", rid, "No se pudo exportar análisis.")
 
 
     def _adv_reset_all(self):
@@ -5436,6 +5449,30 @@ class ScreenshotEditor(ctk.CTkFrame):
 # ======================================================================
 
 class KClientApp(ctk.CTk):
+    def dbg(self, tag: str):
+        try:
+            exists = self.winfo_exists() if hasattr(self, "winfo_exists") else "NA"
+        except Exception:
+            exists = "ERR"
+        print(f"[DBG] {time.time():.3f} {tag} thread={threading.current_thread().name}:{threading.get_ident()} closing={getattr(self, '_closing', False)} exists={exists}")
+
+    def report_callback_exception(self, exc, val, tb):
+        print("[TK CALLBACK EXCEPTION]", exc, val)
+        traceback.print_tb(tb)
+
+    def _start_debug_heartbeat(self):
+        def _heartbeat():
+            self.dbg("HEARTBEAT")
+            try:
+                if not getattr(self, "_closing", False) and self.winfo_exists():
+                    self.after(1000, _heartbeat)
+            except Exception:
+                traceback.print_exc()
+        try:
+            self.after(1000, _heartbeat)
+        except Exception:
+            traceback.print_exc()
+
     def __init__(self):
         super().__init__()
         self.title("Production Manager")
@@ -5448,27 +5485,64 @@ class KClientApp(ctk.CTk):
         except Exception:
             pass
 
-        def _tk_report(exc, val, tb):
-            print("[TK CALLBACK EXCEPTION]")
-            traceback.print_exception(exc, val, tb)
-
-        try:
-            self.report_callback_exception = _tk_report
-        except Exception:
-            pass
-
         def _thread_hook(args):
             try:
                 tname = getattr(args.thread, "name", "?")
+                tid = getattr(args.thread, "ident", "?")
             except Exception:
                 tname = "?"
-            print(f"[THREAD EXCEPTION] thread={tname}")
+                tid = "?"
+            print(f"[THREAD EXCEPTION] thread={tname}:{tid}")
             traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+            print("STACK:", "".join(traceback.format_stack(limit=20)))
 
         try:
             threading.excepthook = _thread_hook
         except Exception:
             pass
+
+        # debug wrappers para messagebox/filedialog
+        try:
+            if not hasattr(messagebox, "_dbg_wrapped"):
+                _orig_showinfo = messagebox.showinfo
+                _orig_showerror = messagebox.showerror
+                _orig_showwarning = messagebox.showwarning
+                _orig_askyesno = messagebox.askyesno
+
+                def _dbg_mbox(name, fn):
+                    def _w(*args, **kwargs):
+                        self.dbg(f"MESSAGEBOX {name}")
+                        print("STACK:", "".join(traceback.format_stack(limit=20)))
+                        return fn(*args, **kwargs)
+                    return _w
+
+                messagebox.showinfo = _dbg_mbox("showinfo", _orig_showinfo)
+                messagebox.showerror = _dbg_mbox("showerror", _orig_showerror)
+                messagebox.showwarning = _dbg_mbox("showwarning", _orig_showwarning)
+                messagebox.askyesno = _dbg_mbox("askyesno", _orig_askyesno)
+                messagebox._dbg_wrapped = True
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            import tkinter.filedialog as _fd
+            if not hasattr(_fd, "_dbg_wrapped"):
+                _orig_open = _fd.askopenfilename
+                _orig_save = getattr(_fd, "asksaveasfilename", None)
+
+                def _dbg_fd(name, fn):
+                    def _w(*args, **kwargs):
+                        self.dbg(f"FILEDIALOG {name}")
+                        print("STACK:", "".join(traceback.format_stack(limit=20)))
+                        return fn(*args, **kwargs)
+                    return _w
+
+                _fd.askopenfilename = _dbg_fd("askopenfilename", _orig_open)
+                if _orig_save:
+                    _fd.asksaveasfilename = _dbg_fd("asksaveasfilename", _orig_save)
+                _fd._dbg_wrapped = True
+        except Exception:
+            traceback.print_exc()
         # =========================
         # Historial por usuario (USER_STATS)
         # =========================
@@ -5570,6 +5644,7 @@ class KClientApp(ctk.CTk):
         # UI Login + autologin
         # =========================
         self._build_login()
+        self._start_debug_heartbeat()
         self._ui_pump_after_id = self.after(25, self._pump_ui_queue)
         self.after(350, self._try_autologin)
 
