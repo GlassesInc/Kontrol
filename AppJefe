@@ -1336,8 +1336,10 @@ class PerfomanceView(ctk.CTkFrame):
         self._ai_chat_history = []  # lista de (role, text)
         self._ai_threads = []
         self._pv_closing = False
+        self._closing = False
         self._ai_event_queue = queue.Queue()
         self._ai_queue_after_id = None
+        self._active_request_id = None
 
         self.max_width = max_width
         self.max_height = max_height
@@ -1776,7 +1778,7 @@ class PerfomanceView(ctk.CTkFrame):
 
     def _safe_after_ui(self, fn):
         try:
-            if getattr(self, "_pv_closing", False):
+            if getattr(self, "_pv_closing", False) or getattr(self, "_closing", False):
                 return False
             if not self.winfo_exists():
                 return False
@@ -1800,19 +1802,22 @@ class PerfomanceView(ctk.CTkFrame):
 
     def _queue_ai_event(self, evt_type: str, req_id: int, payload: str = ""):
         try:
-            self._ai_event_queue.put_nowait((evt_type, int(req_id), payload or ""))
+            t = threading.current_thread()
+            rid = int(req_id)
+            print(f"[AI][enqueue] thread={t.name}:{t.ident} evt={evt_type} rid={rid}")
+            self._ai_event_queue.put_nowait((evt_type, rid, payload or ""))
         except Exception:
-            pass
+            traceback.print_exc()
 
     def _start_ai_queue_poller(self):
-        if getattr(self, "_pv_closing", False):
+        if getattr(self, "_pv_closing", False) or getattr(self, "_closing", False):
             return
         if getattr(self, "_ai_queue_after_id", None):
             return
 
         def _tick():
             self._ai_queue_after_id = None
-            if getattr(self, "_pv_closing", False):
+            if getattr(self, "_pv_closing", False) or getattr(self, "_closing", False):
                 return
             try:
                 if not self.winfo_exists():
@@ -1841,7 +1846,15 @@ class PerfomanceView(ctk.CTkFrame):
             self._ai_queue_after_id = None
 
     def _handle_ai_event(self, evt_type: str, req_id: int, payload: str):
-        if getattr(self, "_pv_closing", False):
+        t = threading.current_thread()
+        exists = False
+        try:
+            exists = bool(self.winfo_exists())
+        except Exception:
+            exists = False
+        print(f"[AI][handle] thread={t.name}:{t.ident} evt={evt_type} rid={req_id} closing={getattr(self, '_closing', False)} exists={exists} active={getattr(self, '_active_request_id', None)}")
+
+        if getattr(self, "_closing", False) or getattr(self, "_pv_closing", False) or (not exists):
             return
 
         if evt_type == "adv_eff":
@@ -1860,8 +1873,8 @@ class PerfomanceView(ctk.CTkFrame):
             self._adv_redraw_all_lines()
             return
 
-        active_req = getattr(self, "_ai_pending_req_id", None)
-        if active_req not in (None, req_id):
+        active_req = getattr(self, "_active_request_id", None)
+        if active_req is None or req_id != active_req:
             return
 
         if evt_type == "status":
@@ -1883,6 +1896,7 @@ class PerfomanceView(ctk.CTkFrame):
             return
 
         if evt_type == "result":
+            self._active_request_id = None
             self._ai_pending_req_id = None
             if self._ai_chat_history and self._ai_chat_history[-1][0] == "assistant" and self._ai_chat_history[-1][1].startswith("Procesando"):
                 self._ai_chat_history.pop()
@@ -1890,7 +1904,8 @@ class PerfomanceView(ctk.CTkFrame):
             self._render_ai_chat_history()
             return
 
-        if evt_type == "error":
+        if evt_type in ("error", "timeout"):
+            self._active_request_id = None
             self._ai_pending_req_id = None
             if self._ai_chat_history and self._ai_chat_history[-1][0] == "assistant" and self._ai_chat_history[-1][1].startswith("Procesando"):
                 self._ai_chat_history.pop()
@@ -1900,6 +1915,7 @@ class PerfomanceView(ctk.CTkFrame):
 
     def _shutdown_async_workers(self):
         self._pv_closing = True
+        self._closing = True
         try:
             if getattr(self, "_ai_queue_after_id", None):
                 self.after_cancel(self._ai_queue_after_id)
@@ -1908,6 +1924,7 @@ class PerfomanceView(ctk.CTkFrame):
         self._ai_queue_after_id = None
         try:
             self._ai_pending_req_id = None
+            self._active_request_id = None
         except Exception:
             pass
         try:
@@ -3482,6 +3499,7 @@ class PerfomanceView(ctk.CTkFrame):
 
         req_id = int(time.time() * 1000)
         self._ai_pending_req_id = req_id
+        self._active_request_id = req_id
         print(f"[AI] start request_id={req_id} user={user} day={day}")
         self._start_ai_queue_poller()
 
@@ -3492,7 +3510,7 @@ class PerfomanceView(ctk.CTkFrame):
                     return
                 if getattr(self, "_ai_pending_req_id", None) != rid:
                     return
-                self._queue_ai_event("error", rid, "La solicitud tardó demasiado. Revisá conexión/API key e intentá nuevamente.")
+                self._queue_ai_event("timeout", rid, "La solicitud tardó demasiado. Revisá conexión/API key e intentá nuevamente.")
                 print(f"[AI] watchdog timeout request_id={rid}")
             except Exception:
                 pass
@@ -3547,7 +3565,7 @@ class PerfomanceView(ctk.CTkFrame):
                             out_text += getattr(c, "text", "")
 
             out_text = (out_text or "").strip()
-            if getattr(self, "_pv_closing", False):
+            if getattr(self, "_pv_closing", False) or getattr(self, "_closing", False):
                 print(f"[AI] request_id={req_id} ignorado por cierre")
                 return
             self._queue_ai_event("result", req_id, out_text or "Sin respuesta.")
@@ -8716,18 +8734,20 @@ class KClientApp(ctk.CTk):
                 w = getattr(self, w_attr, None)
                 if w is not None and w.winfo_exists():
                     self._prepare_widget_for_destroy(w)
+                    print("DESTROY CALLED FROM:", "".join(traceback.format_stack(limit=10)))
                     w.destroy()
             except Exception:
                 pass
 
-        # 5) destruir la app
+        # 5) destruir la app (siempre desde main thread)
         try:
-            # cortar mainloop si está corriendo
+            print("DESTROY CALLED FROM:", "".join(traceback.format_stack(limit=10)))
             try:
+                print("QUIT CALLED FROM:", "".join(traceback.format_stack(limit=10)))
                 self.quit()
             except Exception:
                 pass
-            self.destroy()
+            self.after(0, self.destroy)
         except Exception:
             pass
 
